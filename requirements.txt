@@ -1,0 +1,7 @@
+streamlit
+requests
+pandas
+fpdf==1.7.2
+plotly
+xlsxwriter
+python-dotenv
