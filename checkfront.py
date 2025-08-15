@@ -12,17 +12,27 @@ from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 import calendar
 import re
-import unicodedata  # <-- added
+import unicodedata
+from dotenv import load_dotenv
+import streamlit as st
+import os# <-- added
 
 # --- PAGE CONFIG (must be first Streamlit call) ---
 st.set_page_config(page_title="Shoebox Dashboard", layout="wide")
+
+load_dotenv()
 
 # 🔐 Load environment variables
 env_path = Path("C:/Users/PC/Documents/UEA/.env")
 load_dotenv(dotenv_path=env_path)
 
-API_KEY = os.getenv("API_KEY")
-API_TOKEN = os.getenv("API_TOKEN")
+API_KEY = st.secrets.get("API_KEY") or os.getenv("API_KEY")
+API_TOKEN = st.secrets.get("API_TOKEN") or os.getenv("API_TOKEN")
+
+
+if not API_KEY or not API_TOKEN:
+    st.error("Missing API credentials. Add API_KEY and API_TOKEN to Streamlit secrets (or .env locally).")
+    st.stop()
 
 # --- VAT config ---
 VAT_RATE = 0.20  # change here if needed
@@ -840,3 +850,4 @@ today_str = datetime.today().strftime("%Y-%m-%d")
 pdf_filename = f"shoebox_summary_{today_str}.pdf"
 
 st.sidebar.download_button(label="⬇️ Download PDF", data=pdf_bytes, file_name=pdf_filename, mime="application/pdf")
+
