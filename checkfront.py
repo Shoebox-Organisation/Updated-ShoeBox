@@ -12,27 +12,20 @@ from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 import calendar
 import re
-import unicodedata
-from dotenv import load_dotenv
-import streamlit as st
-import os# <-- added
+import unicodedata  # <-- added
 
 # --- PAGE CONFIG (must be first Streamlit call) ---
 st.set_page_config(page_title="Shoebox Dashboard", layout="wide")
 
-load_dotenv()
+# Your Checkfront account's timezone
+TENANT_TZ = "Europe/London"
 
 # 🔐 Load environment variables
 env_path = Path("C:/Users/PC/Documents/UEA/.env")
 load_dotenv(dotenv_path=env_path)
 
-API_KEY = st.secrets.get("API_KEY") or os.getenv("API_KEY")
-API_TOKEN = st.secrets.get("API_TOKEN") or os.getenv("API_TOKEN")
-
-
-if not API_KEY or not API_TOKEN:
-    st.error("Missing API credentials. Add API_KEY and API_TOKEN to Streamlit secrets (or .env locally).")
-    st.stop()
+API_KEY = os.getenv("API_KEY")
+API_TOKEN = os.getenv("API_TOKEN")
 
 # --- VAT config ---
 VAT_RATE = 0.20  # change here if needed
@@ -44,7 +37,7 @@ def ex_vat(amount: float | int | None, rate: float = VAT_RATE) -> float:
     except Exception:
         return 0.0
 
-# --- Tour allow-list + normaliser (ADDED) ---
+# --- Tour allow-list + normaliser ---
 def _norm_title(s: str) -> str:
     if s is None:
         return ""
@@ -52,6 +45,54 @@ def _norm_title(s: str) -> str:
     s = re.sub(r"\s+", " ", s)      # collapse spaces
     s = s.replace("–", "-")         # en-dash → hyphen
     return s
+
+# --- Helpers for multi-item summaries (e.g., "Guidebook, Norwich's Hidden Street Tour") ---
+SPLIT_RE = re.compile(r"\s*(?:,|/|&|\+| and )\s*")  # splits on commas, slashes, &, +, " and "
+
+def _parts(summary: str) -> list[str]:
+    s = _norm_title(summary)
+    if not s:
+        return []
+    return [p for p in SPLIT_RE.split(s) if p]
+
+def contains_allowed_tour(summary: str) -> bool:
+    parts = _parts(summary)
+    return any(p in TOURS_ALLOWLIST for p in parts)
+
+def _matches_status(row) -> bool:
+    if status_filter == "All":
+        return True
+    return str(row.get("status_name", "")) == status_filter
+
+def _matches_search(row, s: str) -> bool:
+    if not s:
+        return True
+    s = s.strip().lower()
+    return (
+        s in str(row.get("customer_name", "")).lower()
+        or s in str(row.get("customer_email", "")).lower()
+        or s in str(row.get("code", "")).lower()
+        or s in str(row.get("booking_id", "")).lower()
+    )
+
+def _matches_category(row) -> bool:
+    if category_filter == "All":
+        return True
+    return str(row.get("product_category", "")) == category_filter
+
+def _passes_tour_allow(row) -> bool:
+    # Only enforce when Tour category selected
+    if category_filter != "Tour":
+        return True
+    return contains_allowed_tour(str(row.get("summary", "")))
+
+def _matches_specific_product(row) -> bool:
+    if specific_product == "All":
+        return True
+    target = _norm_title(specific_product)
+    return target in _parts(str(row.get("summary", "")))
+
+
 
 TOURS_ALLOWLIST_RAW = [
     "Great Yarmouth - Seafront Tour",
@@ -133,14 +174,17 @@ def get_raw(start, end, include_items=False, filter_on="created"):
 # --- Categorisation helper ---
 CATEGORY_ORDER = ["Tour", "Group", "Room Hire", "Voucher", "Merchandise", "Fee", "Other"]
 
-# (REPLACED) Strict Tour classification via allow-list
 def categorise_product(summary: str) -> str:
-    # STRICT: “Tour” only if exact title matches allow-list (normalised)
-    if _norm_title(summary) in TOURS_ALLOWLIST:
+    ns = _norm_title(summary)
+    if not ns:
+        return "Other"
+
+    # If *any* part of the summary is an allowed tour, classify as Tour
+    if contains_allowed_tour(summary):
         return "Tour"
 
-    # Otherwise keep your existing category rules
-    s = (summary or "").strip().lower()
+    # Otherwise fall back to keywords
+    s = ns
     if re.search(r"\broom\b|meeting|hire", s): return "Room Hire"
     if "group" in s: return "Group"
     if "voucher" in s or "gift" in s: return "Voucher"
@@ -148,48 +192,63 @@ def categorise_product(summary: str) -> str:
     if "fee" in s or "reschedul" in s or "cancell" in s or "admin" in s: return "Fee"
     return "Other"
 
-# --- Prepare DataFrame (bookings) ---
+
 @st.cache_data(ttl=300)
 def prepare_df(raw):
     df = pd.DataFrame(list(raw.get("booking/index", {}).values()))
     if df.empty:
         return df
 
-    # created_date from any plausible source
+    # --- created_date: build from any plausible source, normalize to Europe/London
+    def _to_local_ts(series_like):
+        s_epoch = pd.to_datetime(series_like, unit="s", errors="coerce", utc=True)
+        s_iso   = pd.to_datetime(series_like, errors="coerce", utc=True)
+        s = s_epoch.fillna(s_iso)
+        s = s.dt.tz_convert(TENANT_TZ).dt.tz_localize(None)
+        return s
+
     created = pd.Series(pd.NaT, index=df.index, dtype="datetime64[ns]")
     for col in ("created_date", "created", "created_at", "date_created", "timestamp_created"):
         if col in df.columns:
-            s = pd.to_datetime(df[col], unit="s", errors="coerce")
-            s = s.fillna(pd.to_datetime(df[col], errors="coerce"))
+            s = _to_local_ts(df[col])
             created = created.fillna(s)
     df["created_date"] = created
 
     # numerics
-    for col in ("total", "paid_total", "tax_total"):
+    for col in ("total", "tax_total"):
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors="coerce")
-
-    # precise net from paid_total if tax_total exists; otherwise fall back to divide-by-rate
-    if "tax_total" in df.columns and "paid_total" in df.columns:
-        df["total_ex_vat"] = (
-            df["paid_total"].fillna(0) - df["tax_total"].fillna(0)
-        )
-    elif "paid_total" in df.columns:
-        df["total_ex_vat"] = df["paid_total"].apply(ex_vat)
-    else:
-        df["total_ex_vat"] = 0.0
 
     # labels / helpers
     df["status_name"] = df.get("status_name", "Unknown").fillna("Unknown")
     df["summary"] = df.get("summary", "").astype(str).str.strip()
     df["day"]  = df["created_date"].dt.day_name()
     df["hour"] = df["created_date"].dt.hour
+
+    # --- category & ex-VAT ---
     df["product_category"] = df["summary"].apply(categorise_product)
 
-    # de-dupe
-    df = df.drop_duplicates(subset="booking_id", keep="last") if "booking_id" in df.columns else df.drop_duplicates()
-    return df
+    if "tax_total" in df.columns:
+        # API provides explicit tax amount
+        tax = pd.to_numeric(df["tax_total"], errors="coerce").fillna(0.0)
+        df["total_ex_vat"] = (df["total"].fillna(0.0) - tax).clip(lower=0.0)
 
+    elif "Taxes" in df.columns:
+        # Excel exports provide 'Taxes' column
+        tax = pd.to_numeric(df["Taxes"], errors="coerce").fillna(0.0)
+        df["total_ex_vat"] = (df["total"].fillna(0.0) - tax).clip(lower=0.0)
+
+    else:
+        # Fallback: assume flat VAT rate
+        df["total_ex_vat"] = df["total"].fillna(0.0).apply(ex_vat)
+
+    # --- de-dupe
+    if "booking_id" in df.columns:
+        df = df.drop_duplicates(subset="booking_id", keep="last")
+    else:
+        df = df.drop_duplicates()
+
+    return df
 
 # --- Helper: extract event_date from items (robust) ---
 def _extract_event_dt_from_items(items):
@@ -211,8 +270,8 @@ def _extract_event_dt_from_items(items):
             if pd.notna(dt): cands.append(dt)
     return min(cands) if cands else pd.NaT
 
-# --- PDF report function ---
-def create_detailed_pdf_summary(kpi_data, date_range, top_tour, top_day, recent_rows, logo_path=None):
+# --- PDF report function (now respects VAT toggle) ---
+def create_detailed_pdf_summary(kpi_data, date_range, top_tour, top_day, recent_rows, logo_path=None, use_ex_vat=False):
     pdf = FPDF()
     pdf.add_page()
     if logo_path and Path(logo_path).exists():
@@ -243,26 +302,30 @@ def create_detailed_pdf_summary(kpi_data, date_range, top_tour, top_day, recent_
     pdf.set_font("Arial", "", 11)
 
     col_widths = [15, 50, 35, 20, 30]
-    headers = ["#", "Customer", "Amount (ex VAT)", "Status", "Date"]
+    amount_hdr = "Amount (ex VAT)" if use_ex_vat else "Amount"
+    headers = ["#", "Customer", amount_hdr, "Status", "Date"]
     for i, header in enumerate(headers):
         pdf.cell(col_widths[i], 8, header, border=1)
     pdf.ln()
 
     for row in recent_rows:
-        # precise ex-VAT per booking when tax_total present
-        total_val = row.get("total", 0) or 0
-        tax_val = row.get("tax_total", None)
-        if tax_val is not None:
-            try:
-                net = float(total_val) - float(tax_val or 0)
-            except Exception:
+        total_val = float(row.get("total", 0) or 0)
+        if use_ex_vat:
+            tax_val = row.get("tax_total", None)
+            if tax_val is not None:
+                try:
+                    net = float(total_val) - float(tax_val or 0)
+                except Exception:
+                    net = ex_vat(total_val)
+            else:
                 net = ex_vat(total_val)
+            amount_to_show = net
         else:
-            net = ex_vat(total_val)
+            amount_to_show = total_val
 
         pdf.cell(col_widths[0], 8, str(row.get("booking_id","")), border=1)
         pdf.cell(col_widths[1], 8, str(row.get("customer_name",""))[:24], border=1)
-        pdf.cell(col_widths[2], 8, f"£{net:.2f}", border=1)
+        pdf.cell(col_widths[2], 8, f"£{amount_to_show:.2f}", border=1)
         pdf.cell(col_widths[3], 8, str(row.get("status_name","")), border=1)
         dt = row.get("created_date")
         date_str = datetime.strftime(dt, "%Y-%m-%d") if isinstance(dt, datetime) else str(dt)[:10]
@@ -305,7 +368,7 @@ with st.sidebar.form("filters"):
     if not temp_df.empty:
         if category_filter == "All":
             products_in_cat = sorted(temp_df["summary"].dropna().unique())
-        elif category_filter == "Tour":  # (CHANGED) strict allow-list + presence in data
+        elif category_filter == "Tour":
             present = temp_df["summary"].dropna().astype(str).unique().tolist()
             products_in_cat = sorted(p for p in present if _norm_title(p) in TOURS_ALLOWLIST)
         else:
@@ -322,32 +385,106 @@ if not submitted and "data_ready" not in st.session_state:
     st.stop()
 st.session_state.data_ready = True
 
+AMOUNT_COL   = "total_ex_vat"
+AMOUNT_LABEL = "Amount (ex VAT)"
+
+
+
 def _apply_filters(dfx: pd.DataFrame) -> pd.DataFrame:
+    # Work on a copy so we don't mutate callers
+    dfx = dfx.copy()
+
+    # Ensure required derived columns exist
+    if "summary" not in dfx.columns:
+        dfx["summary"] = ""
+    if "status_name" not in dfx.columns:
+        dfx["status_name"] = "Unknown"
+    if "product_category" not in dfx.columns:
+        dfx["product_category"] = dfx["summary"].apply(categorise_product)
+    if "total_ex_vat" not in dfx.columns:
+        total_num = pd.to_numeric(dfx.get("total", 0.0), errors="coerce").fillna(0.0)
+        if "tax_total" in dfx.columns:
+            tax = pd.to_numeric(dfx["tax_total"], errors="coerce").fillna(0.0)
+            dfx["total_ex_vat"] = (total_num - tax).clip(lower=0.0)
+        elif "Taxes" in dfx.columns:  # Excel export support
+            tax = pd.to_numeric(dfx["Taxes"], errors="coerce").fillna(0.0)
+            dfx["total_ex_vat"] = (total_num - tax).clip(lower=0.0)
+        else:
+            dfx["total_ex_vat"] = total_num.apply(ex_vat)
+
+    # Apply any global exclusions if you defined them
+    try:
+        dfx = dfx[
+            ~dfx["summary"].astype(str).str.contains(EXCLUDE_SUMMARY_RE, na=False)
+            & ~dfx["status_name"].astype(str).str.contains(EXCLUDE_STATUS_RE, na=False)
+        ]
+    except NameError:
+        pass
+
+    # Status
     if status_filter != "All":
         dfx = dfx[dfx["status_name"] == status_filter]
-    if search.strip():
-        s = search.strip().lower()
+
+    # Search
+    s = (search or "").strip().lower()
+    if s:
         dfx = dfx[dfx.apply(
-            lambda r: s in str(r.get("customer_name","")).lower()
-                   or s in str(r.get("customer_email","")).lower()
-                   or s in str(r.get("code","")).lower(),
+            lambda r: s in str(r.get("customer_name", "")).lower()
+                   or s in str(r.get("customer_email", "")).lower()
+                   or s in str(r.get("code", "")).lower()
+                   or s in str(r.get("booking_id", "")).lower(),
             axis=1
         )]
+
+    # Category filter (and Tour allow-list enforcement)
     if category_filter != "All":
         dfx = dfx[dfx["product_category"] == category_filter]
-        # (NEW) enforce allow-list when "Tour" is chosen
+
         if category_filter == "Tour":
-            dfx = dfx[dfx["summary"].astype(str).map(_norm_title).isin(TOURS_ALLOWLIST)]
+            # Keep rows where ANY part of the summary is an allowed tour
+            dfx = dfx[dfx["summary"].astype(str).apply(contains_allowed_tour)]
+
+    # Specific product (match against any part of a multi-item summary)
     if specific_product != "All":
-        dfx = dfx[dfx["summary"] == specific_product]
+        target = _norm_title(specific_product)
+
+        def _has_target(summary: str) -> bool:
+            parts = _parts(summary)          # split multi-item summaries
+            return target in parts           # exact part match
+
+        dfx = dfx[dfx["summary"].astype(str).apply(_has_target)]
+
     return dfx
+
+
+# Normalized local day window for all booking/event filters (exclusive end bound)
+start_ts = pd.Timestamp(start)                      # local 00:00
+end_excl = pd.Timestamp(end) + pd.Timedelta(days=1) # next-day 00:00 (exclusive)
 
 # --- Load booking-date dataset ---
 raw_booking = get_raw(start, end, include_items=False, filter_on="created")
 df_booking = prepare_df(raw_booking)
 df_booking = _apply_filters(df_booking)
 cd_booking = pd.to_datetime(df_booking["created_date"], errors="coerce")
-view_booking = df_booking[cd_booking.notna() & (cd_booking.dt.date >= start) & (cd_booking.dt.date <= end)].copy()
+mask_b = cd_booking.notna() & (cd_booking >= start_ts) & (cd_booking < end_excl)
+view_booking = df_booking.loc[mask_b].copy()
+
+with st.expander("🔎 Debug: Raw Bookings (before filters)"):
+    raw_df = prepare_df(raw_booking).copy()
+    st.dataframe(
+        raw_df[[
+            "booking_id", 
+            "created_date", 
+            "summary", 
+            "status_name", 
+            "customer_name", 
+            "customer_email", 
+            "total", 
+            "tax_total"
+        ]].sort_values("created_date", ascending=False),
+        use_container_width=True
+    )
+    st.caption(f"Total raw rows before filters: {len(raw_df)}")
 
 
 # --- Load event-date dataset (on demand) ---
@@ -372,62 +509,128 @@ def get_event_df(start, end):
     df_event["event_date"] = pd.to_datetime(df_event["event_date"], errors="coerce")
     return df_event
 
+# Only define event view if needed
 if date_basis == "Event date":
     df_event = get_event_df(start, end)
     df_event = _apply_filters(df_event)
     ed_event = pd.to_datetime(df_event["event_date"], errors="coerce")
-    view_event = df_event[ed_event.notna() & (ed_event.dt.date >= start) & (ed_event.dt.date <= end)].copy()
+    mask_e = ed_event.notna() & (ed_event >= start_ts) & (ed_event < end_excl)
+    view_event = df_event.loc[mask_e].copy()
+else:
+    view_event = pd.DataFrame()
 
 # Choose current view (drives KPIs & charts up to Stock section)
 if date_basis == "Event date":
     current_view = view_event.copy()
     current_view["day"] = current_view["event_date"].dt.day_name()
-    current_view["hour"] = current_view["event_date"].dt.hour  # usually 0 for all-day events
+    current_view["hour"] = current_view["event_date"].dt.hour
     basis_series = pd.to_datetime(current_view["event_date"], errors="coerce")
     basis_label = "Event"
 else:
     current_view = view_booking.copy()
     basis_series = pd.to_datetime(current_view["created_date"], errors="coerce")
     basis_label = "Booking"
+    
+    
 
-with st.expander("🔎 Debug (selected basis)"):
-    st.write("Date basis:", date_basis)
-    st.write("Rows (current_view):", len(current_view))
-    st.write("Basis min/max:", basis_series.min(), basis_series.max())
-    st.write("Category filter:", category_filter)
-    st.write("Specific product:", specific_product)
+with st.expander("🧪 Diagnostics: Why are rows being excluded?", expanded=False):
+    # Work from the *unfiltered* base for the chosen basis
+    base_df = view_event.copy() if date_basis == "Event date" else view_booking.copy()
+
+    # Make sure derived columns exist
+    if "product_category" not in base_df.columns:
+        base_df["product_category"] = base_df["summary"].apply(categorise_product)
+
+    # Evaluate each rule as a boolean column
+    s = (search or "").strip().lower()
+    diag = base_df.copy()
+    diag["ok_status"]   = diag.apply(_matches_status, axis=1)
+    diag["ok_search"]   = diag.apply(lambda r: _matches_search(r, s), axis=1)
+    diag["ok_category"] = diag.apply(lambda r: _matches_category(r), axis=1)
+    diag["ok_tourlist"] = diag.apply(lambda r: _passes_tour_allow(r), axis=1)
+    diag["ok_specific"] = diag.apply(lambda r: _matches_specific_product(r), axis=1)
+
+    # Final decision & reason
+    checks = ["ok_status", "ok_search", "ok_category", "ok_tourlist", "ok_specific"]
+    diag["INCLUDED"] = diag[checks].all(axis=1)
+    def _reason(r):
+        if r["INCLUDED"]:
+            return ""
+        failed = [c for c in checks if not r[c]]
+        return ", ".join(failed)
+    diag["excluded_by"] = diag.apply(_reason, axis=1)
+
+    # Summary counts
+    total = len(diag)
+    kept  = int(diag["INCLUDED"].sum())
+    dropped = total - kept
+    st.write(f"Total rows (basis={date_basis}): **{total}**  |  Included: **{kept}**  |  Dropped: **{dropped}**")
+
+    # Show dropped rows with reasons
+    st.markdown("**Dropped rows (with reasons):**")
+    cols_to_show = ["booking_id","created_date","summary","status_name","customer_name","customer_email","total_ex_vat","excluded_by"]
+    existing_cols = [c for c in cols_to_show if c in diag.columns]
+    st.dataframe(
+        diag.loc[~diag["INCLUDED"], existing_cols].sort_values(existing_cols[1] if len(existing_cols)>1 else "booking_id", ascending=False),
+        use_container_width=True
+    )
+
+    # Show included sample (optional)
+    st.markdown("**Included rows (sample):**")
+    st.dataframe(diag.loc[diag["INCLUDED"], existing_cols].head(20), use_container_width=True)
+
 
 if current_view.empty:
     st.warning("No bookings match this window for the selected date basis and filters.")
     st.stop()
 
+with st.expander("🔎 Debug: All Bookings in Current View"):
+    st.dataframe(
+        current_view[[
+            "booking_id", 
+            "created_date", 
+            "summary", 
+            "status_name", 
+            "customer_name", 
+            "customer_email", 
+            AMOUNT_COL
+        ]].sort_values("created_date", ascending=False),
+        use_container_width=True
+    )
+    st.caption(f"Total rows in current view: {len(current_view)}")
+
+
+
 if st.sidebar.button("🔄 Force refresh data"):
     st.cache_data.clear()
     st.cache_resource.clear()
 
-# --- KPIs (BOOKING INDEX ONLY, NET WHEN POSSIBLE) ---
+# --- KPIs (uses AMOUNT_COL everywhere) ---
 total_bookings = len(current_view)
-total_revenue = current_view["total_ex_vat"].sum()
-avg_booking = (total_revenue / total_bookings) if total_bookings else 0.0
-paid_pct = (current_view["paid_total"] > 0).mean() * 100
-repeat_rate = current_view["customer_email"].duplicated().mean() * 100
+amount_series = pd.to_numeric(current_view.get(AMOUNT_COL, 0), errors="coerce").fillna(0)
+total_amount  = amount_series.sum()
+avg_booking   = (total_amount / total_bookings) if total_bookings else 0.0
+paid_pct    = (pd.to_numeric(current_view.get("paid_total", 0), errors="coerce").fillna(0) > 0).mean() * 100
+repeat_rate = current_view["customer_email"].duplicated().mean() * 100 if "customer_email" in current_view.columns else 0.0
 
 kpi_data = {
     "Total Bookings": total_bookings,
-    "Total Revenue (ex VAT)": f"£{total_revenue:,.2f}",
-    "Avg per Booking (ex VAT)": f"£{avg_booking:,.2f}",
+    AMOUNT_LABEL: f"£{total_amount:,.2f}",
+    "Avg per Booking": f"£{avg_booking:,.2f}",
     "Paid %": f"{paid_pct:.1f}%",
     "Repeat Customers %": f"{repeat_rate:.1f}%"
 }
 
+
 k1, k2, k3, k4, k5 = st.columns(5)
 k1.metric("Total Bookings", total_bookings)
-k2.metric("Total Revenue (ex VAT)", f"£{total_revenue:,.2f}")
+k2.metric(AMOUNT_LABEL, f"£{total_amount:,.2f}")
 k3.metric("Avg per Booking (ex VAT)", f"£{avg_booking:,.2f}")
 k4.metric("Paid %", f"{paid_pct:.1f}%")
 k5.metric("Repeat Cust %", f"{repeat_rate:.1f}%")
 
-# --- Charts (BOOKING INDEX ONLY) ---
+
+# --- Charts ---
 st.markdown("### 📈 Insights")
 
 current_view = current_view.copy()
@@ -447,28 +650,30 @@ with col2:
 
 col3, col4 = st.columns(2)
 with col3:
-    product_rev = (current_view.groupby("summary")["total_ex_vat"]
-                   .sum()
-                   .reset_index()
-                   .sort_values("total_ex_vat", ascending=False))
+    product_amount = (
+        current_view.groupby("summary")[AMOUNT_COL]
+        .sum()
+        .reset_index()
+        .sort_values(AMOUNT_COL, ascending=False)
+        .rename(columns={AMOUNT_COL: AMOUNT_LABEL})
+    )
     fig3 = px.bar(
-        product_rev, x="summary", y="total_ex_vat",
-        title=f"💰 Revenue (ex VAT) by Product ({basis_label} Date, Selected Range)", text_auto=True
+        product_amount, x="summary", y=AMOUNT_LABEL,
+        title=f"💰 {AMOUNT_LABEL} by Product ({basis_label} Date, Selected Range)", text_auto=True
     )
     fig3.update_yaxes(tickprefix="£", tickformat=",")
     st.plotly_chart(fig3, use_container_width=True)
 
 with col4:
-    # === QUARTERLY COMPARISON (APRIL → MARCH) ===
+    # === QUARTERLY COMPARISON (APRIL → MARCH), not affected by date filter ===
     today = date.today()
     if today.month < 4:
-        fy_start = date(today.year - 1, 4, 1)   # Apr 1 last year
-        fy_end   = date(today.year, 3, 31)      # Mar 31 this year
+        fy_start = date(today.year - 1, 4, 1)
+        fy_end   = date(today.year, 3, 31)
     else:
-        fy_start = date(today.year, 4, 1)       # Apr 1 this year
-        fy_end   = date(today.year + 1, 3, 31)  # Mar 31 next year
+        fy_start = date(today.year, 4, 1)
+        fy_end   = date(today.year + 1, 3, 31)
 
-    # Get data in the chosen basis
     if date_basis == "Event date":
         df_q = get_event_df(fy_start, fy_end)
         df_q = _apply_filters(df_q)
@@ -481,35 +686,31 @@ with col4:
     df_q = df_q[date_series_q.notna()].copy()
     df_q["periodQ"] = date_series_q.dt.to_period("Q")
 
-    # Build quarter index for the FY window (Q labels will be like 2025Q2 etc.)
-    q_index = pd.period_range(start=fy_start, end=fy_end, freq="Q")
-    q_series = df_q.groupby("periodQ")["total_ex_vat"].sum()
-    q_df = q_series.reindex(q_index, fill_value=0).reset_index()
+    q_index  = pd.period_range(start=fy_start, end=fy_end, freq="Q")
+    q_series = df_q.groupby("periodQ")[AMOUNT_COL].sum()
+    q_df     = q_series.reindex(q_index, fill_value=0).reset_index()
     q_df.columns = ["quarter", "total"]
 
-    # Hide future quarters within the FY
     q_df.loc[(q_df["quarter"].dt.start_time > pd.Timestamp.today()), "total"] = pd.NA
 
-    # Pretty labels (Q1 = Apr–Jun; Q2 = Jul–Sep; Q3 = Oct–Dec; Q4 = Jan–Mar) and title with FY span
     def _fy_quarter_label(p):
         m = p.start_time.month
-        return {4: "Q1 (Apr–Jun)", 7: "Q2 (Jul–Sep)", 10: "Q3 (Oct–Dec)", 1: "Q4 (Jan–Mar)"}.get(m, str(p))
-
+        return {4: "Q1 (Apr–Jun)", 7: "Q2 (Jul–Sep)", 10: "Q3 (Oct–Dec)", 1: "Q4 (Jan–Mar)"}\
+               .get(m, str(p))
     q_df["quarter"] = q_df["quarter"].apply(_fy_quarter_label)
 
     fy_label = f"FY {fy_start.year}/{fy_end.year}"
 
     fig_quarter = px.bar(
         q_df, x="quarter", y="total",
-        title=f"Quarterly Revenue (ex VAT) Comparison ({basis_label} Date, {fy_label})",
+        title=f"Quarterly {AMOUNT_LABEL} Comparison ({basis_label} Date, {fy_label})",
         text="total"
     )
     fig_quarter.update_traces(texttemplate="£%{y:,.0f}")
     fig_quarter.update_yaxes(tickprefix="£", tickformat=",")
     st.plotly_chart(fig_quarter, use_container_width=True)
 
-
-# ----------------  MONTHLY (BOOKING INDEX ONLY)  ----------------
+# ----------------  MONTHLY (full-month totals for months touched by range)  ----------------
 m_start = date(start.year, start.month, 1)
 m_end   = date(end.year, end.month, calendar.monthrange(end.year, end.month)[1])
 
@@ -526,15 +727,15 @@ df_m = df_m[date_series_m.notna()].copy()
 df_m["periodM"] = date_series_m.dt.to_period("M")
 
 month_idx = pd.period_range(start=m_start, end=m_end, freq="M")
-m_series  = df_m.groupby("periodM")["total_ex_vat"].sum().sort_index()
+m_series  = df_m.groupby("periodM")[AMOUNT_COL].sum().sort_index()
 monthly   = m_series.reindex(month_idx, fill_value=0).reset_index()
-monthly.columns = ["Month", "Total Revenue"]
+monthly.columns = ["Month", AMOUNT_LABEL]
 monthly["Month"] = monthly["Month"].dt.strftime("%b %Y")
 
 fig_monthly = px.bar(
-    monthly, x="Month", y="Total Revenue",
-    title=f"📆 Total Monthly Revenue (ex VAT, {basis_label} Date scope)",
-    text="Total Revenue"
+    monthly, x="Month", y=AMOUNT_LABEL,
+    title=f"📆 Total Monthly {AMOUNT_LABEL} ({basis_label} Date scope)",
+    text=AMOUNT_LABEL
 )
 fig_monthly.update_traces(texttemplate="£%{y:,.0f}")
 fig_monthly.update_yaxes(tickprefix="£", tickformat=",")
@@ -543,7 +744,6 @@ st.plotly_chart(fig_monthly, use_container_width=True)
 # Day/Hour charts
 c5, c6 = st.columns(2)
 
-# Day chart (always shown)
 with c5:
     day_order = ["Monday","Tuesday","Wednesday","Thursday","Friday","Saturday","Sunday"]
     day_counts = current_view["day"].value_counts().reindex(day_order).fillna(0).reset_index()
@@ -554,7 +754,6 @@ with c5:
         use_container_width=True
     )
 
-# Hour chart: ONLY show for Booking date (created)
 with c6:
     if date_basis != "Event date":
         hour_counts = (
@@ -569,61 +768,59 @@ with c6:
         )
     else:
         st.caption("⏰ Hour breakdown is hidden for Event date (events typically have no time).")
-        
+
 # === Extended comparisons (weekly, using week beginning dates) ===
-def render_extended_time_comparisons(view_df: pd.DataFrame, basis_series: pd.Series, basis_label: str):
+def render_extended_time_comparisons(view_df: pd.DataFrame, basis_series: pd.Series, basis_label: str,
+                                     amount_col: str, amount_label: str):
     dfv = view_df.copy()
 
-    # Align a timestamp column to the chosen basis (Booking/Event)
     dfv["_basis_ts"] = pd.to_datetime(basis_series, errors="coerce")
     dfv = dfv[dfv["_basis_ts"].notna()].copy()
 
-    # Week beginning (Monday) as a real date, plus a friendly label for the x-axis
     dfv["week_start"] = dfv["_basis_ts"].dt.to_period("W").apply(lambda r: r.start_time.normalize())
     dfv["week_label"] = dfv["week_start"].dt.strftime("%d %b %Y")
     dfv["year"] = dfv["_basis_ts"].dt.year
 
     st.markdown("### 📊 Extended Time-Based Comparisons")
 
-    # 1) Weekly Breakdown by Product (ex VAT), x-axis = week beginning date
+    # 1) Weekly Breakdown by Product (Amount or ex-VAT)
     st.subheader(f"Weekly Breakdown by Product — {basis_label} date (week beginning)")
     weekly_breakdown = (
-        dfv.groupby(["week_start", "week_label", "summary"], as_index=False)["total_ex_vat"]
+        dfv.groupby(["week_start", "week_label", "summary"], as_index=False)[amount_col]
            .sum()
            .sort_values("week_start")
+           .rename(columns={amount_col: amount_label})
     )
     fig_wbp = px.bar(
         weekly_breakdown,
-        x="week_label", y="total_ex_vat", color="summary", barmode="group",
-        title="Weekly Breakdown by Product (ex VAT)"
+        x="week_label", y=amount_label, color="summary", barmode="group",
+        title=f"Weekly Breakdown by Product ({amount_label})"
     )
     fig_wbp.update_yaxes(tickprefix="£", tickformat=",")
-    # Keep the labels in chronological order
     ordered_labels = weekly_breakdown.drop_duplicates("week_label")["week_label"].tolist()
     fig_wbp.update_xaxes(categoryorder="array", categoryarray=ordered_labels)
     st.plotly_chart(fig_wbp, use_container_width=True)
 
-    # 2) Weekly Revenue Comparison (ex VAT) — lines by year, x-axis = week beginning date
-    st.subheader(f"Weekly Revenue Comparison — {basis_label} date (week beginning)")
+    # 2) Weekly Amount/Ex-VAT by Year
+    st.subheader(f"Weekly {amount_label} by Year — {basis_label} date (week beginning)")
     weekly_compare = (
-        dfv.groupby(["year", "week_start", "week_label"], as_index=False)["total_ex_vat"]
+        dfv.groupby(["year", "week_start", "week_label"], as_index=False)[amount_col]
            .sum()
            .sort_values("week_start")
+           .rename(columns={amount_col: amount_label})
     )
     fig_wc = px.line(
         weekly_compare,
-        x="week_label", y="total_ex_vat", color="year", markers=True,
-        title="Weekly Revenue (ex VAT) by Year"
+        x="week_label", y=amount_label, color="year", markers=True,
+        title=f"Weekly {amount_label} by Year"
     )
     fig_wc.update_yaxes(tickprefix="£", tickformat=",")
     ordered_labels_wc = weekly_compare.drop_duplicates("week_label")["week_label"].tolist()
     fig_wc.update_xaxes(categoryorder="array", categoryarray=ordered_labels_wc)
     st.plotly_chart(fig_wc, use_container_width=True)
 
-# Call it with your filtered view + basis
-render_extended_time_comparisons(current_view, basis_series, basis_label)
-
-
+# Call extended comparisons
+render_extended_time_comparisons(current_view, basis_series, basis_label, AMOUNT_COL, AMOUNT_LABEL)
 
 # === STOCK AVAILABILITY & MISSED REVENUE ===
 st.markdown("##  Stock Availability & Missed Revenue")
@@ -710,37 +907,33 @@ try:
     )
     df_stock_base = df_stock_base[is_tour].copy()
 
-    # Observed prices (ex VAT) from bookings
+    # Observed unit prices (always ex VAT)
     product_prices = {}
     df_tmp = df_stock_base[df_stock_base["ticket_qty"].fillna(0) > 0].copy()
     if not df_tmp.empty:
-        df_tmp["unit_price_ex_vat"] = df_tmp.apply(
-            lambda r: (ex_vat(r["total"]) / r["ticket_qty"]) if r["ticket_qty"] else 0.0,
+        df_tmp["unit_price"] = df_tmp.apply(
+            lambda r: ((r["total"] - r.get("Taxes", 0)) / r["ticket_qty"]) if r["ticket_qty"] else 0.0,
             axis=1
         )
-        product_prices = df_tmp.groupby("summary")["unit_price_ex_vat"].median().to_dict()
+        product_prices = df_tmp.groupby("summary")["unit_price"].median().to_dict()
+
 
     # ---------- Capacity & departures ----------
-    # Business rule: tours run with a max of 12 seats per departure.
-    TOUR_SEATS_PER_DEP = 12
+    TOUR_SEATS_PER_DEP = 12  # business rule
 
-    # Tickets per day per product
     perday_tickets = (
         df_stock_base
         .assign(_day=df_stock_base["event_date"].dt.floor("D"))
         .groupby(["summary", "_day"], as_index=False)["ticket_qty"]
         .sum()
     )
-
-    # Estimate departures per day = ceil(tickets_sold_that_day / 12)
     perday_tickets["deps_day"] = (perday_tickets["ticket_qty"] + TOUR_SEATS_PER_DEP - 1) // TOUR_SEATS_PER_DEP
 
-    # Aggregates
     deps_per_day_est = perday_tickets.groupby("summary")["deps_day"].mean().round(2).to_dict()
     days_with_deps   = perday_tickets.groupby("summary")["deps_day"].count().to_dict()
     total_deps       = perday_tickets.groupby("summary")["deps_day"].sum().to_dict()
 
-    # 🔎 Capacity & frequency debug
+    # Debug table
     debug_rows = []
     for product in sorted(df_stock_base["summary"].dropna().unique()):
         debug_rows.append({
@@ -756,26 +949,25 @@ try:
     with st.expander("🔎 Capacity & Departures (debug)"):
         st.dataframe(debug_df)
 
-    # --- Build Stock table using fixed 12 seats/dep + AVG departures/day (original chart logic) ---
+    # --- Build Stock table ---
     rows = []
     cap_sources = {}
-    TOUR_SEATS_PER_DEP = 12  # fixed per your rule
+
+    price_col_label = "Price (ex VAT) (£)"
+    lost_col_label  = "Potential Revenue Lost (ex VAT) (£)"
+
 
     for product in sorted(df_stock_base["summary"].dropna().unique()):
-        pdf = df_stock_base[df_stock_base["summary"] == product]
-        tickets_booked = int(pdf["ticket_qty"].fillna(0).sum())
+        pdfp = df_stock_base[df_stock_base["summary"] == product]
+        tickets_booked = int(pdfp["ticket_qty"].fillna(0).sum())
 
         seats_per_dep = TOUR_SEATS_PER_DEP
         cap_sources[product] = "rule-fixed-12"
 
-        # Use the NEW average departures/day, multiplied by the selected #days (original behaviour)
         avg_deps_per_day = float(deps_per_day_est.get(product, 0.0))
         total_capacity = int(round(seats_per_dep * avg_deps_per_day * num_days))
-
-        # Never show negative availability
         available = max(total_capacity - tickets_booked, 0)
 
-        # Observed median unit price (ex VAT)
         avg_price = float(product_prices.get(product, 0.0))
         lost_revenue = available * avg_price
 
@@ -786,20 +978,19 @@ try:
             "Avg Departures/Day": round(avg_deps_per_day, 2),
             "Capacity (Seats x Deps x Days)": total_capacity,
             "Available": available,
-            "Price ex VAT (£)": round(avg_price, 2),
-            "Potential Revenue Lost ex VAT (£)": round(lost_revenue, 2),
+            price_col_label: round(avg_price, 2),
+            lost_col_label: round(lost_revenue, 2),
         })
 
     stock_df = pd.DataFrame(rows)
 
-    # --- Debug (keep) ---
     with st.expander("🔎 Debug (stock)"):
         st.write("Capacity source by product:", cap_sources)
         st.write("Products in window:", sorted(df_stock_base["summary"].dropna().unique().tolist()))
         st.write("Rows with non-zero tickets:", int((df_stock_base["ticket_qty"] > 0).sum()))
         st.write("Sample stock rows:", stock_df.head(10))
 
-    # --- Render table + charts (original style) ---
+    # --- Render table + charts ---
     with st.expander("📋 Full Stock & Revenue Table"):
         st.dataframe(stock_df)
 
@@ -815,16 +1006,16 @@ try:
         st.plotly_chart(fig_stock, use_container_width=True)
 
     with right:
-        lost = stock_df.sort_values("Potential Revenue Lost ex VAT (£)", ascending=False).copy()
+        lost_sorted = stock_df.sort_values(lost_col_label, ascending=False).copy()
         fig_lost = px.bar(
-            lost,
-            x="Potential Revenue Lost ex VAT (£)",
+            lost_sorted,
+            x=lost_col_label,
             y="Product",
             orientation="h",
-            title="💸 Potential Revenue Lost by Product (ex VAT)",
-            text="Potential Revenue Lost ex VAT (£)"
+            title=f"💸 {lost_col_label} by Product",
+            text=lost_col_label
         )
-        fig_lost.update_yaxes(categoryorder="array", categoryarray=list(lost["Product"]))
+        fig_lost.update_yaxes(categoryorder="array", categoryarray=list(lost_sorted["Product"]))
         fig_lost.update_xaxes(tickprefix="£", tickformat=",")
         fig_lost.update_traces(
             texttemplate="£%{x:,.0f}",
@@ -832,17 +1023,13 @@ try:
         )
         st.plotly_chart(fig_lost, use_container_width=True)
 
-
 except Exception as e:
     st.warning("⚠️ Error calculating stock and lost revenue.")
     st.error(str(e))
 
-
-
-
-# --- PDF Download (booking-date based view for recent rows/top tour) ---
-top_tour = view_booking.groupby("summary")["total_ex_vat"].sum().idxmax() if not view_booking.empty else "N/A"
-top_day = view_booking["day"].mode()[0] if not view_booking.empty else "N/A"
+# --- PDF Download (booking-date based view for recent rows/top tour; respects VAT toggle) ---
+top_tour = view_booking.groupby("summary")[AMOUNT_COL].sum().idxmax() if not view_booking.empty else "N/A"
+top_day = view_booking["day"].mode()[0] if not view_booking.empty and "day" in view_booking.columns else "N/A"
 recent_rows = view_booking.sort_values("created_date", ascending=False).head(5).to_dict(orient="records")
 date_range = f"{start.strftime('%d %b %Y')} to {end.strftime('%d %b %Y')}"
 pdf_bytes = create_detailed_pdf_summary(kpi_data, date_range, top_tour, top_day, recent_rows)
