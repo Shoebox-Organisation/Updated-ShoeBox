@@ -26,23 +26,42 @@ st.set_page_config(page_title="Shoebox Dashboard", layout="wide")
 # Your Checkfront account's timezone
 TENANT_TZ = "Europe/London"
 
-API_KEY = os.getenv("API_KEY")
-API_TOKEN = os.getenv("API_TOKEN")
+# ---- Secrets / env (portable: Streamlit Cloud or local .env) ----
+load_dotenv()  # harmless in cloud, loads local .env in dev
+
+
+def _get_secret(name: str, default: str | None = None) -> str | None:
+    try:
+        if name in st.secrets:
+            return st.secrets[name]
+    except Exception:
+        pass
+    return os.getenv(name, default)
+
+
+API_KEY = _get_secret("API_KEY")
+API_TOKEN = _get_secret("API_TOKEN")
+
+# Base URL: override via Streamlit secrets or env if needed
+API_BASE = _get_secret("CHECKFRONT_API_BASE", "https://api.checkfront.com/3.0/booking")
+
+# Optional: temporary escape hatch in cloud (ONLY for short-term debugging)
+ALLOW_INSECURE = str(_get_secret("ALLOW_INSECURE_SSL", "false")).lower() == "true"
 
 # --- TLS trust setup (Windows-friendly) ---
 USING_OS_TRUST = False
 try:
     import truststore
-    truststore.inject_into_ssl()  # Use Windows/macOS/Linux system trust store
+    truststore.inject_into_ssl()  # Use system trust store (works great on Windows/macOS)
     USING_OS_TRUST = True
 except Exception:
-    # fallback: use certifi bundle
-    import certifi
+    # Fallback: use certifi bundle (Linux/cloud)
     os.environ.setdefault("SSL_CERT_FILE", certifi.where())
     os.environ.setdefault("REQUESTS_CA_BUNDLE", certifi.where())
 
 # --- VAT config ---
 VAT_RATE = 0.20  # change here if needed
+
 
 def ex_vat(amount: float | int | None, rate: float = VAT_RATE) -> float:
     """Fallback ex-VAT calculation when tax_total is unavailable."""
@@ -119,19 +138,26 @@ TOURS_ALLOWLIST_RAW = [
 ]
 TOURS_ALLOWLIST = {_norm_title(x) for x in TOURS_ALLOWLIST_RAW}
 
+# ---- HTTPS session (retries, timeouts, TLS verify) ----
 @st.cache_resource
-def get_session():
-    import requests
+def get_session() -> requests.Session:
     s = requests.Session()
-    retries = Retry(total=5, connect=5, read=5, backoff_factor=0.5,
-                    status_forcelist=(429, 500, 502, 503, 504),
-                    allowed_methods=("GET", "POST"))
+    retries = Retry(
+        total=5, connect=5, read=5, backoff_factor=0.5,
+        status_forcelist=(429, 500, 502, 503, 504),
+        allowed_methods=("GET", "POST"),
+    )
     s.mount("https://", HTTPAdapter(max_retries=retries, pool_connections=20, pool_maxsize=20))
     s.mount("http://",  HTTPAdapter(max_retries=retries, pool_connections=20, pool_maxsize=20))
 
     if not USING_OS_TRUST:
-        import certifi
-        s.verify = certifi.where()   # only if OS trust not injected
+        s.verify = certifi.where()   # Linux/cloud path
+
+    if ALLOW_INSECURE:
+        s.verify = False  # ⚠️ temporary only; remove when SSL chain is fixed
+
+    # inject default timeout if caller doesn't pass one
+    s.request = _with_default_timeout(s.request, timeout=30)
     return s
 
 
@@ -141,6 +167,7 @@ def _with_default_timeout(request_func, timeout: int):
         kwargs.setdefault("timeout", timeout)
         return request_func(method, url, **kwargs)
     return wrapper
+
 
 SESSION = get_session()
 
@@ -152,7 +179,7 @@ def get_auth_header():
 
 # --- Fetch bookings (paginated) ---
 def fetch_bookings(start_date, end_date, limit=250, include_items=False, max_pages=4000, filter_on="created"):
-    API_BASE = os.getenv("CHECKFRONT_API_BASE", "https://api.checkfront.com/3.0/booking")
+    base = API_BASE  # use the configurable API base
     headers = get_auth_header()
     page = 1
     seen, out = set(), []
@@ -174,10 +201,9 @@ def fetch_bookings(start_date, end_date, limit=250, include_items=False, max_pag
             r = SESSION.get(base, headers=headers, params=params)
             r.raise_for_status()
         except requests.exceptions.SSLError as e:
-            # Clear, actionable error for logs/UI
             raise RuntimeError(
                 f"SSL/TLS handshake failed when calling {base}. "
-                f"Using CA bundle at {certifi.where()}. Details: {e}"
+                f"Using CA bundle at {certifi.where() if not USING_OS_TRUST else 'OS trust store'}. Details: {e}"
             ) from e
 
         data = r.json()
@@ -198,14 +224,14 @@ def fetch_bookings(start_date, end_date, limit=250, include_items=False, max_pag
     return {"booking/index": {i: b for i, b in enumerate(out)}}
 
 def fetch_booking_details(booking_id: str | int):
-    url = f"https://theshoebox.checkfront.co.uk/api/3.0/booking/{booking_id}"
+    url = f"{API_BASE.rstrip('/')}/{booking_id}"
     try:
         r = SESSION.get(url, headers=get_auth_header(), params={"expand": "items"}, timeout=15)
         r.raise_for_status()
     except requests.exceptions.SSLError as e:
         raise RuntimeError(
             f"SSL/TLS handshake failed when calling {url}. "
-            f"Using CA bundle at {certifi.where()}. Details: {e}"
+            f"Using CA bundle at {certifi.where() if not USING_OS_TRUST else 'OS trust store'}. Details: {e}"
         ) from e
     return r.json()
 
@@ -213,6 +239,7 @@ def fetch_booking_details(booking_id: str | int):
 @st.cache_data(ttl=300)
 def get_raw(start, end, include_items=False, filter_on="created"):
     return fetch_bookings(start, end, include_items=include_items, filter_on=filter_on)
+
 
 # --- Categorisation helper ---
 CATEGORY_ORDER = ["Tour", "Group", "Room Hire", "Voucher", "Merchandise", "Fee", "Other"]
@@ -1081,6 +1108,7 @@ today_str = datetime.today().strftime("%Y-%m-%d")
 pdf_filename = f"shoebox_summary_{today_str}.pdf"
 
 st.sidebar.download_button(label="⬇️ Download PDF", data=pdf_bytes, file_name=pdf_filename, mime="application/pdf")
+
 
 
 
