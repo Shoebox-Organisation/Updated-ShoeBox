@@ -247,17 +247,27 @@ def fetch_booking_details(booking_id: str | int):
 
 
 
-# --- Cached API results (simple cache keys) ---
-@st.cache_data(ttl=900)  # 15 minutes
-def get_raw(start_iso: str, end_iso: str, include_items: bool, filter_on: str = "created"):
-    start = date.fromisoformat(start_iso)
-    end   = date.fromisoformat(end_iso)
+# --- Cached API results (accept str or date) ---
+@st.cache_data(ttl=900)
+def get_raw(start_in, end_in, include_items: bool, filter_on: str = "created"):
+    # Normalize inputs to date objects
+    if isinstance(start_in, str):
+        start = date.fromisoformat(start_in)
+    else:
+        start = start_in  # already a date
+
+    if isinstance(end_in, str):
+        end = date.fromisoformat(end_in)
+    else:
+        end = end_in  # already a date
+
     return fetch_bookings(start, end, include_items=include_items, filter_on=filter_on)
 
 # --- Cached transform ---
 @st.cache_data(ttl=900)
 def prepare_df_cached(raw):
     return prepare_df(raw)
+
 
 # --- Categorisation helper ---
 CATEGORY_ORDER = ["Tour", "Group", "Room Hire", "Voucher", "Merchandise", "Fee", "Other"]
@@ -1126,6 +1136,7 @@ today_str = datetime.today().strftime("%Y-%m-%d")
 pdf_filename = f"shoebox_summary_{today_str}.pdf"
 
 st.sidebar.download_button(label="⬇️ Download PDF", data=pdf_bytes, file_name=pdf_filename, mime="application/pdf")
+
 
 
 
