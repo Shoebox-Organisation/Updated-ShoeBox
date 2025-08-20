@@ -152,7 +152,7 @@ def get_auth_header():
 
 # --- Fetch bookings (paginated) ---
 def fetch_bookings(start_date, end_date, limit=250, include_items=False, max_pages=4000, filter_on="created"):
-    base = "https://theshoebox.checkfront.co.uk/api/3.0/booking"
+    API_BASE = os.getenv("CHECKFRONT_API_BASE", "https://api.checkfront.com/3.0/booking")
     headers = get_auth_header()
     page = 1
     seen, out = set(), []
@@ -1081,5 +1081,6 @@ today_str = datetime.today().strftime("%Y-%m-%d")
 pdf_filename = f"shoebox_summary_{today_str}.pdf"
 
 st.sidebar.download_button(label="⬇️ Download PDF", data=pdf_bytes, file_name=pdf_filename, mime="application/pdf")
+
 
 
