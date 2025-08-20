@@ -194,7 +194,6 @@ def get_auth_header():
 
 # --- Fetch bookings (paginated) ---
 def fetch_bookings(start_date, end_date, limit=250, include_items=False, max_pages=4000, filter_on="created"):
-    API_BASE = os.getenv("CHECKFRONT_API_BASE", "https://api.checkfront.com/3.0/booking")
     headers = get_auth_header()
     page = 1
     seen, out = set(), []
@@ -202,24 +201,23 @@ def fetch_bookings(start_date, end_date, limit=250, include_items=False, max_pag
     while page <= max_pages:
         params = [("limit", limit), ("page", page)]
         if filter_on == "created":
-            params.append(("created_date", f">{start_date.isoformat()}"))
-            params.append(("created_date", f"<{(end_date + timedelta(days=1)).isoformat()}"))
+            params += [
+                ("created_date", f">{start_date.isoformat()}"),
+                ("created_date", f"<{(end_date + timedelta(days=1)).isoformat()}"),
+            ]
         else:
-            params.append(("start_date", start_date.isoformat()))
-            params.append(("end_date", end_date.isoformat()))
-        params.append(("sort", "created_date"))
-        params.append(("dir", "asc"))
+            params += [("start_date", start_date.isoformat()),
+                       ("end_date", end_date.isoformat())]
+        params += [("sort", "created_date"), ("dir", "asc")]
         if include_items:
             params.append(("expand", "items"))
 
-        # --- Make the request ---
+        # Use the module-level API_BASE (tenant URL)
         r = SESSION.get(API_BASE, headers=headers, params=params)
 
-        # --- Custom error handling (instead of try/except) ---
         if not r.ok:
             msg = f"{r.status_code} {r.reason} — {r.url}"
-            body = r.text
-            st.error(f"API error: {msg}\n\n{body[:500]}")
+            st.error(f"API error: {msg}\n\n{r.text[:500]}")
             raise requests.HTTPError(msg, response=r)
 
         data = r.json()
@@ -241,16 +239,17 @@ def fetch_bookings(start_date, end_date, limit=250, include_items=False, max_pag
 
 
 def fetch_booking_details(booking_id: str | int):
-    url = f"https://theshoebox.checkfront.co.uk/api/3.0/booking/{booking_id}"
+    # Build from the same base to avoid drift
+    url = f"{API_BASE.rstrip('/')}/{booking_id}"
     r = SESSION.get(url, headers=get_auth_header(), params={"expand": "items"}, timeout=15)
 
     if not r.ok:
         msg = f"{r.status_code} {r.reason} — {r.url}"
-        body = r.text
-        st.error(f"API error: {msg}\n\n{body[:500]}")
+        st.error(f"API error: {msg}\n\n{r.text[:500]}")
         raise requests.HTTPError(msg, response=r)
 
     return r.json()
+
 
 # --- Cache API results ---
 @st.cache_data(ttl=300)
@@ -1125,6 +1124,7 @@ today_str = datetime.today().strftime("%Y-%m-%d")
 pdf_filename = f"shoebox_summary_{today_str}.pdf"
 
 st.sidebar.download_button(label="⬇️ Download PDF", data=pdf_bytes, file_name=pdf_filename, mime="application/pdf")
+
 
 
 
