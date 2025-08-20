@@ -1,7 +1,11 @@
 streamlit
-requests
 pandas
-fpdf==1.7.2
 plotly
-xlsxwriter
+fpdf
 python-dotenv
+requests==2.32.3
+urllib3==2.2.2
+certifi==2024.7.4
+idna==3.7
+charset-normalizer==3.4.3
+truststore
