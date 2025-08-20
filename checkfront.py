@@ -1,18 +1,24 @@
-import streamlit as st
-import requests
-import pandas as pd
-import base64
-from datetime import date, timedelta, datetime
-from fpdf import FPDF
-import plotly.express as px
-from pathlib import Path
-from dotenv import load_dotenv
 import os
+from pathlib import Path
+from datetime import date, timedelta, datetime
+import base64
+import re
+import unicodedata
+import calendar
+
+import streamlit as st
+import pandas as pd
+import plotly.express as px
+
+from dotenv import load_dotenv
+from fpdf import FPDF
+
+# Networking
+import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
-import calendar
-import re
-import unicodedata  # <-- added
+import certifi
+import ssl
 
 # --- PAGE CONFIG (must be first Streamlit call) ---
 st.set_page_config(page_title="Shoebox Dashboard", layout="wide")
@@ -20,12 +26,20 @@ st.set_page_config(page_title="Shoebox Dashboard", layout="wide")
 # Your Checkfront account's timezone
 TENANT_TZ = "Europe/London"
 
-# 🔐 Load environment variables
-env_path = Path("C:/Users/PC/Documents/UEA/.env")
-load_dotenv(dotenv_path=env_path)
-
 API_KEY = os.getenv("API_KEY")
 API_TOKEN = os.getenv("API_TOKEN")
+
+# --- TLS trust setup (Windows-friendly) ---
+USING_OS_TRUST = False
+try:
+    import truststore
+    truststore.inject_into_ssl()  # Use Windows/macOS/Linux system trust store
+    USING_OS_TRUST = True
+except Exception:
+    # fallback: use certifi bundle
+    import certifi
+    os.environ.setdefault("SSL_CERT_FILE", certifi.where())
+    os.environ.setdefault("REQUESTS_CA_BUNDLE", certifi.where())
 
 # --- VAT config ---
 VAT_RATE = 0.20  # change here if needed
@@ -46,7 +60,7 @@ def _norm_title(s: str) -> str:
     s = s.replace("–", "-")         # en-dash → hyphen
     return s
 
-# --- Helpers for multi-item summaries (e.g., "Guidebook, Norwich's Hidden Street Tour") ---
+# --- Helpers for multi-item summaries ---
 SPLIT_RE = re.compile(r"\s*(?:,|/|&|\+| and )\s*")  # splits on commas, slashes, &, +, " and "
 
 def _parts(summary: str) -> list[str]:
@@ -92,8 +106,6 @@ def _matches_specific_product(row) -> bool:
     target = _norm_title(specific_product)
     return target in _parts(str(row.get("summary", "")))
 
-
-
 TOURS_ALLOWLIST_RAW = [
     "Great Yarmouth - Seafront Tour",
     "The TIPSY Tavern Trail Tour",
@@ -107,16 +119,42 @@ TOURS_ALLOWLIST_RAW = [
 ]
 TOURS_ALLOWLIST = {_norm_title(x) for x in TOURS_ALLOWLIST_RAW}
 
-# --- Persistent HTTP session for speed ---
+# --- Diagnostics (one-time print to logs to verify env) ---
+def _log_tls_env_once():
+    if not st.session_state.get("_tls_logged", False):
+        st.session_state["_tls_logged"] = True
+        try:
+            st.write("TLS diagnostics:",
+                     {"requests": requests.__version__,
+                      "certifi": certifi.where(),
+                      "openssl": ssl.OPENSSL_VERSION})
+        except Exception:
+            pass
+
+_log_tls_env_once()
+
 @st.cache_resource
 def get_session():
+    import requests
     s = requests.Session()
-    retry = Retry(total=3, backoff_factor=0.5,
-                  status_forcelist=[429, 500, 502, 503, 504])
-    s.mount("https://", HTTPAdapter(max_retries=retry,
-                                    pool_connections=20,
-                                    pool_maxsize=20))
+    retries = Retry(total=5, connect=5, read=5, backoff_factor=0.5,
+                    status_forcelist=(429, 500, 502, 503, 504),
+                    allowed_methods=("GET", "POST"))
+    s.mount("https://", HTTPAdapter(max_retries=retries, pool_connections=20, pool_maxsize=20))
+    s.mount("http://",  HTTPAdapter(max_retries=retries, pool_connections=20, pool_maxsize=20))
+
+    if not USING_OS_TRUST:
+        import certifi
+        s.verify = certifi.where()   # only if OS trust not injected
     return s
+
+
+def _with_default_timeout(request_func, timeout: int):
+    """Wrap Session.request to inject a default timeout if none provided."""
+    def wrapper(method, url, **kwargs):
+        kwargs.setdefault("timeout", timeout)
+        return request_func(method, url, **kwargs)
+    return wrapper
 
 SESSION = get_session()
 
@@ -132,6 +170,7 @@ def fetch_bookings(start_date, end_date, limit=250, include_items=False, max_pag
     headers = get_auth_header()
     page = 1
     seen, out = set(), []
+
     while page <= max_pages:
         params = [("limit", limit), ("page", page)]
         if filter_on == "created":
@@ -144,26 +183,44 @@ def fetch_bookings(start_date, end_date, limit=250, include_items=False, max_pag
         params.append(("dir", "asc"))
         if include_items:
             params.append(("expand", "items"))
-        r = SESSION.get(base, headers=headers, params=params, timeout=30)
-        r.raise_for_status()
+
+        try:
+            r = SESSION.get(base, headers=headers, params=params)
+            r.raise_for_status()
+        except requests.exceptions.SSLError as e:
+            # Clear, actionable error for logs/UI
+            raise RuntimeError(
+                f"SSL/TLS handshake failed when calling {base}. "
+                f"Using CA bundle at {certifi.where()}. Details: {e}"
+            ) from e
+
         data = r.json()
         page_rows = list((data.get("booking/index") or {}).values())
         if not page_rows:
             break
+
         for b in page_rows:
             bid = b.get("booking_id")
             if bid and bid not in seen:
                 seen.add(bid)
                 out.append(b)
+
         if len(page_rows) < limit:
             break
         page += 1
+
     return {"booking/index": {i: b for i, b in enumerate(out)}}
 
 def fetch_booking_details(booking_id: str | int):
     url = f"https://theshoebox.checkfront.co.uk/api/3.0/booking/{booking_id}"
-    r = SESSION.get(url, headers=get_auth_header(), params={"expand": "items"}, timeout=15)
-    r.raise_for_status()
+    try:
+        r = SESSION.get(url, headers=get_auth_header(), params={"expand": "items"}, timeout=15)
+        r.raise_for_status()
+    except requests.exceptions.SSLError as e:
+        raise RuntimeError(
+            f"SSL/TLS handshake failed when calling {url}. "
+            f"Using CA bundle at {certifi.where()}. Details: {e}"
+        ) from e
     return r.json()
 
 # --- Cache API results ---
@@ -191,6 +248,7 @@ def categorise_product(summary: str) -> str:
     if "guidebook" in s or "souvenir" in s or "merch" in s: return "Merchandise"
     if "fee" in s or "reschedul" in s or "cancell" in s or "admin" in s: return "Fee"
     return "Other"
+
 
 
 @st.cache_data(ttl=300)
