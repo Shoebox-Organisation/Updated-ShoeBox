@@ -119,20 +119,6 @@ TOURS_ALLOWLIST_RAW = [
 ]
 TOURS_ALLOWLIST = {_norm_title(x) for x in TOURS_ALLOWLIST_RAW}
 
-# --- Diagnostics (one-time print to logs to verify env) ---
-def _log_tls_env_once():
-    if not st.session_state.get("_tls_logged", False):
-        st.session_state["_tls_logged"] = True
-        try:
-            st.write("TLS diagnostics:",
-                     {"requests": requests.__version__,
-                      "certifi": certifi.where(),
-                      "openssl": ssl.OPENSSL_VERSION})
-        except Exception:
-            pass
-
-_log_tls_env_once()
-
 @st.cache_resource
 def get_session():
     import requests
@@ -1095,4 +1081,5 @@ today_str = datetime.today().strftime("%Y-%m-%d")
 pdf_filename = f"shoebox_summary_{today_str}.pdf"
 
 st.sidebar.download_button(label="⬇️ Download PDF", data=pdf_bytes, file_name=pdf_filename, mime="application/pdf")
+
 
