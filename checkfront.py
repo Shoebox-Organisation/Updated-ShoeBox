@@ -29,7 +29,6 @@ TENANT_TZ = "Europe/London"
 # ---- Secrets / env (portable: Streamlit Cloud or local .env) ----
 load_dotenv()  # harmless in cloud, loads local .env in dev
 
-
 def _get_secret(name: str, default: str | None = None) -> str | None:
     try:
         if name in st.secrets:
@@ -38,18 +37,21 @@ def _get_secret(name: str, default: str | None = None) -> str | None:
         pass
     return os.getenv(name, default)
 
-
 API_KEY = _get_secret("API_KEY")
 API_TOKEN = _get_secret("API_TOKEN")
 
-# Base URL: override via Streamlit secrets or env if needed
-API_BASE = _get_secret("CHECKFRONT_API_BASE", "https://api.checkfront.com/3.0/booking")
+# Base URL: default to your tenant URL; override via secrets if needed
+API_BASE = _get_secret(
+    "CHECKFRONT_API_BASE",
+    "https://theshoebox.checkfront.co.uk/api/3.0/booking"
+)
 
 # Optional: temporary escape hatch in cloud (ONLY for short-term debugging)
 ALLOW_INSECURE = str(_get_secret("ALLOW_INSECURE_SSL", "false")).lower() == "true"
 
-# Add this along with API_KEY, API_TOKEN
+# (Only needed if you ever switch back to a global host that requires it)
 CHECKFRONT_ACCOUNT = _get_secret("CHECKFRONT_ACCOUNT", "theshoebox")  # your subdomain w/o TLD
+
 
 
 # --- TLS trust setup (Windows-friendly) ---
@@ -1123,6 +1125,7 @@ today_str = datetime.today().strftime("%Y-%m-%d")
 pdf_filename = f"shoebox_summary_{today_str}.pdf"
 
 st.sidebar.download_button(label="⬇️ Download PDF", data=pdf_bytes, file_name=pdf_filename, mime="application/pdf")
+
 
 
 
