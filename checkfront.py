@@ -48,6 +48,10 @@ API_BASE = _get_secret("CHECKFRONT_API_BASE", "https://api.checkfront.com/3.0/bo
 # Optional: temporary escape hatch in cloud (ONLY for short-term debugging)
 ALLOW_INSECURE = str(_get_secret("ALLOW_INSECURE_SSL", "false")).lower() == "true"
 
+# Add this along with API_KEY, API_TOKEN
+CHECKFRONT_ACCOUNT = _get_secret("CHECKFRONT_ACCOUNT", "theshoebox")  # your subdomain w/o TLD
+
+
 # --- TLS trust setup (Windows-friendly) ---
 USING_OS_TRUST = False
 try:
@@ -175,7 +179,16 @@ SESSION = get_session()
 def get_auth_header():
     token = f"{API_KEY}:{API_TOKEN}"
     b64 = base64.b64encode(token.encode()).decode()
-    return {"Authorization": f"Basic {b64}", "Accept": "application/json"}
+    h = {
+        "Authorization": f"Basic {b64}",
+        "Accept": "application/json",
+        "User-Agent": "ShoeboxDashboard/1.0",
+    }
+    # If we're using the global API host, tell it which account
+    if "api.checkfront.com" in API_BASE:
+        h["X-Checkfront-Account"] = CHECKFRONT_ACCOUNT  # e.g., "theshoebox"
+    return h
+
 
 # --- Fetch bookings (paginated) ---
 def fetch_bookings(start_date, end_date, limit=250, include_items=False, max_pages=4000, filter_on="created"):
@@ -198,15 +211,15 @@ def fetch_bookings(start_date, end_date, limit=250, include_items=False, max_pag
             params.append(("expand", "items"))
 
         try:
-            r = SESSION.get(base, headers=headers, params=params)
-            r.raise_for_status()
-        except requests.exceptions.SSLError as e:
-            raise RuntimeError(
-                f"SSL/TLS handshake failed when calling {base}. "
-                f"Using CA bundle at {certifi.where() if not USING_OS_TRUST else 'OS trust store'}. Details: {e}"
-            ) from e
+           r = SESSION.get(base, headers=headers, params=params)
+if not r.ok:
+    # Show code, reason, URL and first 500 chars of body in Streamlit + logs
+    msg = f"{r.status_code} {r.reason} — {r.url}"
+    body = r.text
+    st.error(f"API error: {msg}\n\n{body[:500]}")
+    raise requests.HTTPError(msg, response=r)
+data = r.json()
 
-        data = r.json()
         page_rows = list((data.get("booking/index") or {}).values())
         if not page_rows:
             break
@@ -1108,6 +1121,7 @@ today_str = datetime.today().strftime("%Y-%m-%d")
 pdf_filename = f"shoebox_summary_{today_str}.pdf"
 
 st.sidebar.download_button(label="⬇️ Download PDF", data=pdf_bytes, file_name=pdf_filename, mime="application/pdf")
+
 
 
 
