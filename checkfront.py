@@ -192,8 +192,8 @@ def get_auth_header():
     return h
 
 
-# --- Fetch bookings (paginated) ---
-def fetch_bookings(start_date, end_date, limit=250, include_items=False, max_pages=4000, filter_on="created"):
+# --- Fetch bookings (paginated, faster defaults) ---
+def fetch_bookings(start_date, end_date, limit=1000, include_items=False, max_pages=1000, filter_on="created"):
     headers = get_auth_header()
     page = 1
     seen, out = set(), []
@@ -210,11 +210,9 @@ def fetch_bookings(start_date, end_date, limit=250, include_items=False, max_pag
                        ("end_date", end_date.isoformat())]
         params += [("sort", "created_date"), ("dir", "asc")]
         if include_items:
-            params.append(("expand", "items"))
+            params.append(("expand", "items"))  # slower; only when needed
 
-        # Use the module-level API_BASE (tenant URL)
         r = SESSION.get(API_BASE, headers=headers, params=params)
-
         if not r.ok:
             msg = f"{r.status_code} {r.reason} — {r.url}"
             st.error(f"API error: {msg}\n\n{r.text[:500]}")
@@ -239,23 +237,27 @@ def fetch_bookings(start_date, end_date, limit=250, include_items=False, max_pag
 
 
 def fetch_booking_details(booking_id: str | int):
-    # Build from the same base to avoid drift
     url = f"{API_BASE.rstrip('/')}/{booking_id}"
     r = SESSION.get(url, headers=get_auth_header(), params={"expand": "items"}, timeout=15)
-
     if not r.ok:
         msg = f"{r.status_code} {r.reason} — {r.url}"
         st.error(f"API error: {msg}\n\n{r.text[:500]}")
         raise requests.HTTPError(msg, response=r)
-
     return r.json()
 
 
-# --- Cache API results ---
-@st.cache_data(ttl=300)
-def get_raw(start, end, include_items=False, filter_on="created"):
+
+# --- Cached API results (simple cache keys) ---
+@st.cache_data(ttl=900)  # 15 minutes
+def get_raw(start_iso: str, end_iso: str, include_items: bool, filter_on: str = "created"):
+    start = date.fromisoformat(start_iso)
+    end   = date.fromisoformat(end_iso)
     return fetch_bookings(start, end, include_items=include_items, filter_on=filter_on)
 
+# --- Cached transform ---
+@st.cache_data(ttl=900)
+def prepare_df_cached(raw):
+    return prepare_df(raw)
 
 # --- Categorisation helper ---
 CATEGORY_ORDER = ["Tour", "Group", "Room Hire", "Voucher", "Merchandise", "Fee", "Other"]
@@ -1124,6 +1126,7 @@ today_str = datetime.today().strftime("%Y-%m-%d")
 pdf_filename = f"shoebox_summary_{today_str}.pdf"
 
 st.sidebar.download_button(label="⬇️ Download PDF", data=pdf_bytes, file_name=pdf_filename, mime="application/pdf")
+
 
 
 
