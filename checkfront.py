@@ -192,7 +192,7 @@ def get_auth_header():
 
 # --- Fetch bookings (paginated) ---
 def fetch_bookings(start_date, end_date, limit=250, include_items=False, max_pages=4000, filter_on="created"):
-    base = API_BASE  # use the configurable API base
+    API_BASE = os.getenv("CHECKFRONT_API_BASE", "https://api.checkfront.com/3.0/booking")
     headers = get_auth_header()
     page = 1
     seen, out = set(), []
@@ -210,16 +210,17 @@ def fetch_bookings(start_date, end_date, limit=250, include_items=False, max_pag
         if include_items:
             params.append(("expand", "items"))
 
-        try:
-           r = SESSION.get(base, headers=headers, params=params)
-if not r.ok:
-    # Show code, reason, URL and first 500 chars of body in Streamlit + logs
-    msg = f"{r.status_code} {r.reason} — {r.url}"
-    body = r.text
-    st.error(f"API error: {msg}\n\n{body[:500]}")
-    raise requests.HTTPError(msg, response=r)
-data = r.json()
+        # --- Make the request ---
+        r = SESSION.get(API_BASE, headers=headers, params=params)
 
+        # --- Custom error handling (instead of try/except) ---
+        if not r.ok:
+            msg = f"{r.status_code} {r.reason} — {r.url}"
+            body = r.text
+            st.error(f"API error: {msg}\n\n{body[:500]}")
+            raise requests.HTTPError(msg, response=r)
+
+        data = r.json()
         page_rows = list((data.get("booking/index") or {}).values())
         if not page_rows:
             break
@@ -236,16 +237,17 @@ data = r.json()
 
     return {"booking/index": {i: b for i, b in enumerate(out)}}
 
+
 def fetch_booking_details(booking_id: str | int):
-    url = f"{API_BASE.rstrip('/')}/{booking_id}"
-    try:
-        r = SESSION.get(url, headers=get_auth_header(), params={"expand": "items"}, timeout=15)
-        r.raise_for_status()
-    except requests.exceptions.SSLError as e:
-        raise RuntimeError(
-            f"SSL/TLS handshake failed when calling {url}. "
-            f"Using CA bundle at {certifi.where() if not USING_OS_TRUST else 'OS trust store'}. Details: {e}"
-        ) from e
+    url = f"https://theshoebox.checkfront.co.uk/api/3.0/booking/{booking_id}"
+    r = SESSION.get(url, headers=get_auth_header(), params={"expand": "items"}, timeout=15)
+
+    if not r.ok:
+        msg = f"{r.status_code} {r.reason} — {r.url}"
+        body = r.text
+        st.error(f"API error: {msg}\n\n{body[:500]}")
+        raise requests.HTTPError(msg, response=r)
+
     return r.json()
 
 # --- Cache API results ---
@@ -1121,6 +1123,7 @@ today_str = datetime.today().strftime("%Y-%m-%d")
 pdf_filename = f"shoebox_summary_{today_str}.pdf"
 
 st.sidebar.download_button(label="⬇️ Download PDF", data=pdf_bytes, file_name=pdf_filename, mime="application/pdf")
+
 
 
 
