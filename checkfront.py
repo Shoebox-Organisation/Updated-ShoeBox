@@ -18,6 +18,9 @@ import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 import certifi
+from fpdf import FPDF
+from pathlib import Path
+from datetime import datetime
 
 # --- PAGE CONFIG (must be first Streamlit call) ---
 st.set_page_config(page_title="Shoebox Dashboard", layout="wide")
@@ -898,7 +901,10 @@ st.markdown("##  Stock Availability & Missed Revenue")
 st.caption("Filtered to tours only. Ticket totals are the number of tickets sold (EVENT-based).")
 
 stock_start = st.date_input("Start Date for Stock Analysis", value=date.today())
-stock_end   = st.date_input("End Date for Stock Analysis",   value=date.today() + pd.Timedelta(days=30)).date()
+stock_end = st.date_input(
+    "End Date for Stock Analysis",
+    value=date.today() + timedelta(days=30)
+)
 num_days = (stock_end - stock_start).days + 1
 
 try:
@@ -1106,6 +1112,84 @@ except Exception as e:
     st.warning("⚠️ Error calculating stock and lost revenue.")
     st.error(str(e))
 
+def create_detailed_pdf_summary(kpi_data, date_range, top_tour, top_day, recent_rows,
+                                logo_path=None, use_ex_vat=True):
+    pdf = FPDF()
+    pdf.add_page()
+
+    # Optional logo
+    if logo_path and Path(logo_path).exists():
+        pdf.image(str(logo_path), x=10, y=8, w=33)
+        pdf.set_xy(50, 10)
+    else:
+        pdf.set_y(15)
+
+    pdf.set_font("Arial", "B", 16)
+    pdf.cell(0, 10, "Shoebox Sales Summary Report", ln=True, align="C")
+    pdf.ln(5)
+
+    pdf.set_font("Arial", "", 12)
+    pdf.cell(0, 10, f"Date Range: {date_range}", ln=True)
+    pdf.ln(2)
+
+    # KPIs
+    pdf.set_font("Arial", "B", 12)
+    pdf.cell(0, 10, "Key Metrics", ln=True)
+    pdf.set_font("Arial", "", 12)
+    for label, value in kpi_data.items():
+        pdf.cell(0, 8, f"{label}: {value}", ln=True)
+    pdf.ln(5)
+
+    # Top bits
+    pdf.set_font("Arial", "B", 12)
+    pdf.cell(0, 10, "Top Performer", ln=True)
+    pdf.set_font("Arial", "", 12)
+    pdf.cell(0, 8, f"Best-Selling Tour: {top_tour}", ln=True)
+    pdf.cell(0, 8, f"Most Popular Day: {top_day}", ln=True)
+    pdf.ln(5)
+
+    # Recent bookings table
+    pdf.set_font("Arial", "B", 12)
+    pdf.cell(0, 10, "Recent Bookings", ln=True)
+    pdf.set_font("Arial", "", 11)
+
+    col_widths = [20, 60, 35, 30, 35]
+    amount_hdr = "Amount (ex VAT)" if use_ex_vat else "Amount"
+    headers = ["#", "Customer", amount_hdr, "Status", "Date"]
+    for i, header in enumerate(headers):
+        pdf.cell(col_widths[i], 8, header, border=1)
+    pdf.ln()
+
+    def _ex_vat_val(total_val, tax_val):
+        try:
+            if tax_val is not None:
+                return float(total_val) - float(tax_val or 0)
+            return float(total_val) / 1.2
+        except Exception:
+            return 0.0
+
+    for row in recent_rows:
+        total_val = float(row.get("total", 0) or 0)
+        tax_val   = row.get("tax_total", None)
+        amount_to_show = _ex_vat_val(total_val, tax_val) if use_ex_vat else total_val
+
+        created_dt = row.get("created_date")
+        if isinstance(created_dt, (pd.Timestamp, datetime)):
+            date_str = created_dt.strftime("%Y-%m-%d")
+        else:
+            date_str = str(created_dt)[:10]
+
+        pdf.cell(col_widths[0], 8, str(row.get("booking_id", "")), border=1)
+        pdf.cell(col_widths[1], 8, str(row.get("customer_name", ""))[:32], border=1)
+        pdf.cell(col_widths[2], 8, f"£{amount_to_show:,.2f}", border=1)
+        pdf.cell(col_widths[3], 8, str(row.get("status_name", ""))[:14], border=1)
+        pdf.cell(col_widths[4], 8, date_str, border=1)
+        pdf.ln()
+
+    return pdf.output(dest="S").encode("latin-1")
+
+
+
 # ----- PDF Download (always render in sidebar) -----
 from pathlib import Path
 from datetime import datetime
@@ -1158,3 +1242,4 @@ with st.sidebar:
     else:
         st.button("Download PDF (unavailable)", disabled=True, use_container_width=True)
         st.caption("PDF will appear once there’s data and no errors creating the file.")
+
