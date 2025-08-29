@@ -1106,76 +1106,55 @@ except Exception as e:
     st.warning("⚠️ Error calculating stock and lost revenue.")
     st.error(str(e))
 
-# --- PDF Download (booking-date based view for recent rows; header reflects ex-VAT) ---
-top_tour = view_booking.groupby("summary")[AMOUNT_COL].sum().idxmax() if not view_booking.empty else "N/A"
-top_day = view_booking["day"].mode()[0] if not view_booking.empty and "day" in view_booking.columns else "N/A"
-recent_rows = view_booking.sort_values("created_date", ascending=False).head(5).to_dict(orient="records")
+# ----- PDF Download (always render in sidebar) -----
+from pathlib import Path
+from datetime import datetime
+
+def _safe_recent_rows(df):
+    if df.empty:
+        return [], "N/A", "N/A"
+    top_tour = df.groupby("summary")[AMOUNT_COL].sum().idxmax() if "summary" in df.columns else "N/A"
+    top_day  = (df["day"].mode()[0] if "day" in df.columns and not df["day"].dropna().empty else "N/A")
+    recent   = (
+        df.sort_values("created_date", ascending=False)
+          .head(5)
+          .to_dict(orient="records")
+    )
+    return recent, top_tour, top_day
+
+recent_rows, top_tour, top_day = _safe_recent_rows(view_booking)
 date_range = f"{start.strftime('%d %b %Y')} to {end.strftime('%d %b %Y')}"
-def create_detailed_pdf_summary(kpi_data, date_range, top_tour, top_day, recent_rows, logo_path=None, use_ex_vat=True):
-    pdf = FPDF()
-    pdf.add_page()
-    if logo_path and Path(logo_path).exists():
-        pdf.image(str(logo_path), x=10, y=8, w=33)
-        pdf.set_xy(50, 10)
+logo_path = Path(__file__).parent / "shoebox.png"
+
+# Build the PDF bytes (guarded)
+pdf_bytes = None
+try:
+    pdf_bytes = create_detailed_pdf_summary(
+        kpi_data=kpi_data,
+        date_range=date_range,
+        top_tour=top_tour,
+        top_day=top_day,
+        recent_rows=recent_rows,
+        logo_path=str(logo_path) if logo_path.exists() else None,
+        use_ex_vat=(AMOUNT_COL == "total_ex_vat"),
+    )
+except Exception as e:
+    # Show a small warning in the sidebar instead of failing silently
+    with st.sidebar:
+        st.warning(f"Could not build PDF: {e}")
+
+# Always render something in the sidebar
+with st.sidebar:
+    st.markdown("---")
+    st.subheader("Report")
+    if pdf_bytes:
+        st.download_button(
+            label="⬇️ Download PDF",
+            data=pdf_bytes,
+            file_name=f"shoebox_summary_{datetime.today().strftime('%Y-%m-%d')}.pdf",
+            mime="application/pdf",
+            use_container_width=True,
+        )
     else:
-        pdf.set_y(15)
-    pdf.set_font("Arial", "B", 16)
-    pdf.cell(0, 10, "Shoebox Sales Summary Report", ln=True, align="C")
-    pdf.ln(5)
-    pdf.set_font("Arial", "", 12)
-    pdf.cell(0, 10, f"Date Range: {date_range}", ln=True)
-    pdf.ln(2)
-    pdf.set_font("Arial", "B", 12)
-    pdf.cell(0, 10, "Key Metrics", ln=True)
-    pdf.set_font("Arial", "", 12)
-    for label, value in kpi_data.items():
-        pdf.cell(0, 8, f"{label}: {value}", ln=True)
-    pdf.ln(5)
-    pdf.set_font("Arial", "B", 12)
-    pdf.cell(0, 10, "Top Performer", ln=True)
-    pdf.set_font("Arial", "", 12)
-    pdf.cell(0, 8, f"Best-Selling Tour: {top_tour}", ln=True)
-    pdf.cell(0, 8, f"Most Popular Day: {top_day}", ln=True)
-    pdf.ln(5)
-    pdf.set_font("Arial", "B", 12)
-    pdf.cell(0, 10, "Recent Bookings", ln=True)
-    pdf.set_font("Arial", "", 11)
-
-    col_widths = [15, 50, 35, 20, 30]
-    amount_hdr = "Amount (ex VAT)" if use_ex_vat else "Amount"
-    headers = ["#", "Customer", amount_hdr, "Status", "Date"]
-    for i, header in enumerate(headers):
-        pdf.cell(col_widths[i], 8, header, border=1)
-    pdf.ln()
-
-    for row in recent_rows:
-        total_val = float(row.get("total", 0) or 0)
-        if use_ex_vat:
-            tax_val = row.get("tax_total", None)
-            if tax_val is not None:
-                try:
-                    net = float(total_val) - float(tax_val or 0)
-                except Exception:
-                    net = ex_vat(total_val)
-            else:
-                net = ex_vat(total_val)
-            amount_to_show = net
-        else:
-            amount_to_show = total_val
-
-        pdf.cell(col_widths[0], 8, str(row.get("booking_id","")), border=1)
-        pdf.cell(col_widths[1], 8, str(row.get("customer_name",""))[:24], border=1)
-        pdf.cell(col_widths[2], 8, f"£{amount_to_show:.2f}", border=1)
-        pdf.cell(col_widths[3], 8, str(row.get("status_name","")), border=1)
-        dtv = row.get("created_date")
-        date_str = dtv.strftime("%Y-%m-%d") if isinstance(dtv, datetime) else str(dtv)[:10]
-        pdf.cell(col_widths[4], 8, date_str, border=1)
-        pdf.ln()
-    return pdf.output(dest="S").encode("latin-1")
-
-pdf_bytes = create_detailed_pdf_summary(
-    kpi_data, date_range, top_tour, top_day, recent_rows, use_ex_vat=(AMOUNT_COL=="total_ex_vat")
-)
-today_str = datetime.today().strftime("%Y-%m-%d")
-pdf_filename = f"shoebox_summary_{today_str}.pdf"
-st.sidebar.download_button(label="⬇️ Download PDF", data=pdf_bytes, file_name=pdf_filename, mime="application/pdf")
+        st.button("Download PDF (unavailable)", disabled=True, use_container_width=True)
+        st.caption("PDF will appear once there’s data and no errors creating the file.")
