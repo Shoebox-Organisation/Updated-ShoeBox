@@ -896,18 +896,104 @@ def render_extended_time_comparisons(view_df: pd.DataFrame, basis_series: pd.Ser
 # Call extended comparisons (same placement as your file)
 render_extended_time_comparisons(current_view, basis_series, basis_label, AMOUNT_COL, AMOUNT_LABEL)
 
-# === STOCK AVAILABILITY & MISSED REVENUE (unchanged logic, uses API_BASE under the hood) ===
-st.markdown("##  Stock Availability & Missed Revenue")
-st.caption("Filtered to tours only. Ticket totals are the number of tickets sold (EVENT-based).")
+# ================================
+# Stock Availability + PDF Download
+# ================================
+from datetime import datetime, timedelta
+from pathlib import Path
+from fpdf import FPDF
 
-stock_start = st.date_input("Start Date for Stock Analysis", value=date.today())
-stock_end = st.date_input(
-    "End Date for Stock Analysis",
-    value=date.today() + timedelta(days=30)
-)
-num_days = (stock_end - stock_start).days + 1
+# ---- PDF generator ----
+def create_detailed_pdf_summary(kpi_data, date_range, top_tour, top_day, recent_rows,
+                                logo_path=None, use_ex_vat=True):
+    pdf = FPDF()
+    pdf.add_page()
 
+    # Optional logo
+    if logo_path and Path(logo_path).exists():
+        pdf.image(str(logo_path), x=10, y=8, w=33)
+        pdf.set_xy(50, 10)
+    else:
+        pdf.set_y(15)
+
+    pdf.set_font("Arial", "B", 16)
+    pdf.cell(0, 10, "Shoebox Sales Summary Report", ln=True, align="C")
+    pdf.ln(5)
+
+    pdf.set_font("Arial", "", 12)
+    pdf.cell(0, 10, f"Date Range: {date_range}", ln=True)
+    pdf.ln(2)
+
+    # KPIs
+    pdf.set_font("Arial", "B", 12)
+    pdf.cell(0, 10, "Key Metrics", ln=True)
+    pdf.set_font("Arial", "", 12)
+    for label, value in kpi_data.items():
+        pdf.cell(0, 8, f"{label}: {value}", ln=True)
+    pdf.ln(5)
+
+    # Top performer
+    pdf.set_font("Arial", "B", 12)
+    pdf.cell(0, 10, "Top Performer", ln=True)
+    pdf.set_font("Arial", "", 12)
+    pdf.cell(0, 8, f"Best-Selling Tour: {top_tour}", ln=True)
+    pdf.cell(0, 8, f"Most Popular Day: {top_day}", ln=True)
+    pdf.ln(5)
+
+    # Recent bookings table
+    pdf.set_font("Arial", "B", 12)
+    pdf.cell(0, 10, "Recent Bookings", ln=True)
+    pdf.set_font("Arial", "", 11)
+
+    col_widths = [20, 60, 35, 30, 35]
+    amount_hdr = "Amount (ex VAT)" if use_ex_vat else "Amount"
+    headers = ["#", "Customer", amount_hdr, "Status", "Date"]
+    for i, header in enumerate(headers):
+        pdf.cell(col_widths[i], 8, header, border=1)
+    pdf.ln()
+
+    def _ex_vat_val(total_val, tax_val):
+        try:
+            if tax_val is not None:
+                return float(total_val) - float(tax_val or 0)
+            return float(total_val) / 1.2  # fallback if no tax field
+        except Exception:
+            return 0.0
+
+    for row in recent_rows:
+        total_val = float(row.get("total", 0) or 0)
+        tax_val   = row.get("tax_total", None)
+        amount_to_show = _ex_vat_val(total_val, tax_val) if use_ex_vat else total_val
+
+        created_dt = row.get("created_date")
+        if isinstance(created_dt, (pd.Timestamp, datetime)):
+            date_str = created_dt.strftime("%Y-%m-%d")
+        else:
+            date_str = str(created_dt)[:10]
+
+        pdf.cell(col_widths[0], 8, str(row.get("booking_id", ""))[:10], border=1)
+        pdf.cell(col_widths[1], 8, str(row.get("customer_name", ""))[:32], border=1)
+        pdf.cell(col_widths[2], 8, f"£{amount_to_show:,.2f}", border=1)
+        pdf.cell(col_widths[3], 8, str(row.get("status_name", ""))[:14], border=1)
+        pdf.cell(col_widths[4], 8, date_str, border=1)
+        pdf.ln()
+
+    return pdf.output(dest="S").encode("latin-1")
+
+
+# ================================
+#  Stock Availability & Missed Revenue (fully guarded)
+# ================================
 try:
+    st.markdown("##  Stock Availability & Missed Revenue")
+    st.caption("Filtered to tours only. Ticket totals are the number of tickets sold (EVENT-based).")
+
+    # Use datetime.timedelta and do NOT call .date() — keep as date objects
+    stock_start = st.date_input("Start Date for Stock Analysis", value=date.today())
+    stock_end   = st.date_input("End Date for Stock Analysis",   value=date.today() + timedelta(days=30))
+    num_days = (stock_end - stock_start).days + 1
+
+    # Pull bookings by EVENT DATE (expand items)
     try:
         raw_stock = get_raw(stock_start, stock_end, include_items=True, filter_on="event")
     except TypeError:
@@ -915,6 +1001,7 @@ try:
 
     df_items = prepare_df(raw_stock).copy()
 
+    # Ensure 'items' exists and is a list
     if "items" not in df_items.columns:
         if "item" in df_items.columns:
             def _to_list(x):
@@ -927,10 +1014,12 @@ try:
 
     def _safe_int(v):
         try:
-            n = int(float(v));  return n if n >= 0 else 0
+            n = int(float(v))
+            return n if n >= 0 else 0
         except Exception:
             return 0
 
+    # Ticket qty from items; fallback to /booking/{id} if mostly zeros
     def _count_qty(items):
         if isinstance(items, dict): items = list(items.values())
         if not isinstance(items, list): return 0
@@ -960,8 +1049,8 @@ try:
                 enriched.append(0)
         df_items["ticket_qty"] = enriched
 
-    # Robust event_date extraction for stock window
-    def _extract_event_dt_from_items_stock(items):
+    # Robust event_date extraction
+    def _extract_event_dt_from_items(items):
         if isinstance(items, dict): items = list(items.values())
         if not isinstance(items, list): return pd.NaT
         cands = []
@@ -980,13 +1069,14 @@ try:
                 if pd.notna(dt): cands.append(dt)
         return min(cands) if cands else pd.NaT
 
-    df_items["event_date"] = df_items["items"].apply(_extract_event_dt_from_items_stock)
+    df_items["event_date"] = df_items["items"].apply(_extract_event_dt_from_items)
     if "date_desc" in df_items.columns:
         df_items["event_date"] = df_items["event_date"].fillna(pd.to_datetime(df_items["date_desc"], errors="coerce"))
     if "created_date" in df_items.columns:
         df_items["event_date"] = df_items["event_date"].fillna(df_items["created_date"])
     df_items["event_date"] = pd.to_datetime(df_items["event_date"], errors="coerce")
 
+    # Filter by EVENT date window
     df_stock_base = df_items.loc[
         (df_items["event_date"] >= pd.Timestamp(stock_start)) &
         (df_items["event_date"] <= pd.Timestamp(stock_end))
@@ -999,6 +1089,7 @@ try:
     )
     df_stock_base = df_stock_base[is_tour].copy()
 
+    # Observed unit prices (always ex VAT)
     product_prices = {}
     df_tmp = df_stock_base[df_stock_base["ticket_qty"].fillna(0) > 0].copy()
     if not df_tmp.empty:
@@ -1008,7 +1099,8 @@ try:
         )
         product_prices = df_tmp.groupby("summary")["unit_price"].median().to_dict()
 
-    TOUR_SEATS_PER_DEP = 12
+    # Capacity & departures
+    TOUR_SEATS_PER_DEP = 12  # business rule
 
     perday_tickets = (
         df_stock_base
@@ -1022,6 +1114,7 @@ try:
     days_with_deps   = perday_tickets.groupby("summary")["deps_day"].count().to_dict()
     total_deps       = perday_tickets.groupby("summary")["deps_day"].sum().to_dict()
 
+    # Debug table
     debug_rows = []
     for product in sorted(df_stock_base["summary"].dropna().unique()):
         debug_rows.append({
@@ -1035,11 +1128,10 @@ try:
     debug_df = pd.DataFrame(debug_rows).sort_values(["Product"]).reset_index(drop=True)
 
     with st.expander("🔎 Capacity & Departures (debug)"):
-        st.dataframe(debug_df)
+        st.dataframe(debug_df, use_container_width=True)
 
+    # Stock table
     rows = []
-    cap_sources = {}
-
     price_col_label = "Price (ex VAT) (£)"
     lost_col_label  = "Potential Revenue Lost (ex VAT) (£)"
 
@@ -1048,8 +1140,6 @@ try:
         tickets_booked = int(pdfp["ticket_qty"].fillna(0).sum())
 
         seats_per_dep = TOUR_SEATS_PER_DEP
-        cap_sources[product] = "rule-fixed-12"
-
         avg_deps_per_day = float(deps_per_day_est.get(product, 0.0))
         total_capacity = int(round(seats_per_dep * avg_deps_per_day * num_days))
         available = max(total_capacity - tickets_booked, 0)
@@ -1070,14 +1160,8 @@ try:
 
     stock_df = pd.DataFrame(rows)
 
-    with st.expander("🔎 Debug (stock)"):
-        st.write("Capacity source by product:", cap_sources)
-        st.write("Products in window:", sorted(df_stock_base["summary"].dropna().unique().tolist()))
-        st.write("Rows with non-zero tickets:", int((df_stock_base["ticket_qty"] > 0).sum()))
-        st.write("Sample stock rows:", stock_df.head(10))
-
     with st.expander("📋 Full Stock & Revenue Table"):
-        st.dataframe(stock_df)
+        st.dataframe(stock_df, use_container_width=True)
 
     left, right = st.columns(2)
     with left:
@@ -1109,91 +1193,14 @@ try:
         st.plotly_chart(fig_lost, use_container_width=True)
 
 except Exception as e:
-    st.warning("⚠️ Error calculating stock and lost revenue.")
-    st.error(str(e))
-
-def create_detailed_pdf_summary(kpi_data, date_range, top_tour, top_day, recent_rows,
-                                logo_path=None, use_ex_vat=True):
-    pdf = FPDF()
-    pdf.add_page()
-
-    # Optional logo
-    if logo_path and Path(logo_path).exists():
-        pdf.image(str(logo_path), x=10, y=8, w=33)
-        pdf.set_xy(50, 10)
-    else:
-        pdf.set_y(15)
-
-    pdf.set_font("Arial", "B", 16)
-    pdf.cell(0, 10, "Shoebox Sales Summary Report", ln=True, align="C")
-    pdf.ln(5)
-
-    pdf.set_font("Arial", "", 12)
-    pdf.cell(0, 10, f"Date Range: {date_range}", ln=True)
-    pdf.ln(2)
-
-    # KPIs
-    pdf.set_font("Arial", "B", 12)
-    pdf.cell(0, 10, "Key Metrics", ln=True)
-    pdf.set_font("Arial", "", 12)
-    for label, value in kpi_data.items():
-        pdf.cell(0, 8, f"{label}: {value}", ln=True)
-    pdf.ln(5)
-
-    # Top bits
-    pdf.set_font("Arial", "B", 12)
-    pdf.cell(0, 10, "Top Performer", ln=True)
-    pdf.set_font("Arial", "", 12)
-    pdf.cell(0, 8, f"Best-Selling Tour: {top_tour}", ln=True)
-    pdf.cell(0, 8, f"Most Popular Day: {top_day}", ln=True)
-    pdf.ln(5)
-
-    # Recent bookings table
-    pdf.set_font("Arial", "B", 12)
-    pdf.cell(0, 10, "Recent Bookings", ln=True)
-    pdf.set_font("Arial", "", 11)
-
-    col_widths = [20, 60, 35, 30, 35]
-    amount_hdr = "Amount (ex VAT)" if use_ex_vat else "Amount"
-    headers = ["#", "Customer", amount_hdr, "Status", "Date"]
-    for i, header in enumerate(headers):
-        pdf.cell(col_widths[i], 8, header, border=1)
-    pdf.ln()
-
-    def _ex_vat_val(total_val, tax_val):
-        try:
-            if tax_val is not None:
-                return float(total_val) - float(tax_val or 0)
-            return float(total_val) / 1.2
-        except Exception:
-            return 0.0
-
-    for row in recent_rows:
-        total_val = float(row.get("total", 0) or 0)
-        tax_val   = row.get("tax_total", None)
-        amount_to_show = _ex_vat_val(total_val, tax_val) if use_ex_vat else total_val
-
-        created_dt = row.get("created_date")
-        if isinstance(created_dt, (pd.Timestamp, datetime)):
-            date_str = created_dt.strftime("%Y-%m-%d")
-        else:
-            date_str = str(created_dt)[:10]
-
-        pdf.cell(col_widths[0], 8, str(row.get("booking_id", "")), border=1)
-        pdf.cell(col_widths[1], 8, str(row.get("customer_name", ""))[:32], border=1)
-        pdf.cell(col_widths[2], 8, f"£{amount_to_show:,.2f}", border=1)
-        pdf.cell(col_widths[3], 8, str(row.get("status_name", ""))[:14], border=1)
-        pdf.cell(col_widths[4], 8, date_str, border=1)
-        pdf.ln()
-
-    return pdf.output(dest="S").encode("latin-1")
+    # Guard the rest of the app from any stock errors so the PDF button still renders
+    with st.expander("⚠️ Stock analysis failed (details)", expanded=False):
+        st.exception(e)
 
 
-
-# ----- PDF Download (always render in sidebar) -----
-from pathlib import Path
-from datetime import datetime
-
+# ================================
+# PDF build + Sidebar Download
+# ================================
 def _safe_recent_rows(df):
     if df.empty:
         return [], "N/A", "N/A"
@@ -1210,7 +1217,6 @@ recent_rows, top_tour, top_day = _safe_recent_rows(view_booking)
 date_range = f"{start.strftime('%d %b %Y')} to {end.strftime('%d %b %Y')}"
 logo_path = Path(__file__).parent / "shoebox.png"
 
-# Build the PDF bytes (guarded)
 pdf_bytes = None
 try:
     pdf_bytes = create_detailed_pdf_summary(
@@ -1223,11 +1229,9 @@ try:
         use_ex_vat=(AMOUNT_COL == "total_ex_vat"),
     )
 except Exception as e:
-    # Show a small warning in the sidebar instead of failing silently
     with st.sidebar:
         st.warning(f"Could not build PDF: {e}")
 
-# Always render something in the sidebar
 with st.sidebar:
     st.markdown("---")
     st.subheader("Report")
@@ -1241,5 +1245,6 @@ with st.sidebar:
         )
     else:
         st.button("Download PDF (unavailable)", disabled=True, use_container_width=True)
-        st.caption("PDF will appear once there’s data and no errors creating the file.")
+        st.caption("PDF will appear once there’s data and the report is built.")
+
 
