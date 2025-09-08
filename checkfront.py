@@ -1110,7 +1110,10 @@ try:
         st.plotly_chart(fig_lost, use_container_width=True)
 
 
-
+except Exception as e:
+    # Guard the rest of the app from any stock errors so the PDF button still renders
+    with st.expander("⚠️ Stock analysis failed (details)", expanded=False):
+        st.exception(e)
 
 # ================================
 # PDF build + Sidebar Download
@@ -1160,6 +1163,7 @@ with st.sidebar:
     else:
         st.button("Download PDF (unavailable)", disabled=True, use_container_width=True)
         st.caption("PDF will appear once there’s data and the report is built.")
+
 
 
 
