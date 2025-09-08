@@ -786,6 +786,7 @@ render_extended_time_comparisons(current_view, basis_series, basis_label, AMOUNT
 
 # === QUARTERLY COMPARISON (APRIL → MARCH), not affected by the selected range ===
 st.markdown("### 📊 Quarterly Revenue (FY Apr–Mar)")
+subtitle = "Not affected by filters, however will show entire year of the filtered data"
 
 # Financial year covering today, Apr -> Mar
 today = date.today()
@@ -1201,6 +1202,7 @@ with st.sidebar:
     else:
         st.button("Download PDF (unavailable)", disabled=True, use_container_width=True)
         st.caption("PDF will appear once there’s data and the report is built.")
+
 
 
 
