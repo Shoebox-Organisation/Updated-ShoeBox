@@ -313,16 +313,7 @@ with st.sidebar:
 if not st.session_state.get("applied_once", False):
     st.stop()
 
-# From here on it's safe to do any data fetching (get_raw, etc.)
-
-# Build status choices only AFTER the gate, so first-load shows the help instead of a spinner
-temp_raw = get_raw(start, end, include_items=False, filter_on="created")
-temp_df  = prepare_df(temp_raw)
-status_choices = ["All"] + (sorted(temp_df["status_name"].dropna().unique()) if not temp_df.empty else [])
-
-with st.sidebar:
-    status_filter = st.selectbox("Filter by Booking Status", status_choices, index=0, key="status_sel")
-
+# From here on it's safe to do any data fetching (get_raw, etc.
 
 # Mirror old variables
 start = st.session_state.start_date
@@ -1222,6 +1213,7 @@ with st.sidebar:
     else:
         st.button("Download PDF (unavailable)", disabled=True, use_container_width=True)
         st.caption("PDF will appear once there’s data and the report is built.")
+
 
 
 
