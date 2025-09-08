@@ -914,7 +914,221 @@ def create_detailed_pdf_summary(kpi_data, date_range, top_tour, top_day, recent_
     return pdf.output(dest="S").encode("latin-1")
 
 
+# ================================
+#  Stock Availability & Missed Revenue (fully guarded)
+# ================================
+try:
+    st.markdown("##  Stock Availability & Missed Revenue")
+    st.caption("Filtered to tours only. Ticket totals are the number of tickets sold (EVENT-based).")
 
+    # Use datetime.timedelta and do NOT call .date() — keep as date objects
+    stock_start = st.date_input("Start Date for Stock Analysis", value=date.today())
+    stock_end   = st.date_input("End Date for Stock Analysis",   value=date.today() + timedelta(days=30))
+    num_days = (stock_end - stock_start).days + 1
+
+    # Pull bookings by EVENT DATE (expand items)
+    try:
+        raw_stock = get_raw(stock_start, stock_end, include_items=True, filter_on="event")
+    except TypeError:
+        raw_stock = get_raw(stock_start, stock_end, include_items=True)
+
+    df_items = prepare_df(raw_stock).copy()
+
+    # Ensure 'items' exists and is a list
+    if "items" not in df_items.columns:
+        if "item" in df_items.columns:
+            def _to_list(x):
+                if isinstance(x, dict): return list(x.values())
+                if isinstance(x, list): return x
+                return []
+            df_items["items"] = df_items["item"].apply(_to_list)
+        else:
+            df_items["items"] = [[] for _ in range(len(df_items))]
+
+    def _safe_int(v):
+        try:
+            n = int(float(v))
+            return n if n >= 0 else 0
+        except Exception:
+            return 0
+
+    # Ticket qty from items; fallback to /booking/{id} if mostly zeros
+    def _count_qty(items):
+        if isinstance(items, dict): items = list(items.values())
+        if not isinstance(items, list): return 0
+        t = 0
+        for it in items:
+            if isinstance(it, dict): t += _safe_int(it.get("qty", 0))
+        return t
+
+    df_items["ticket_qty"] = df_items["items"].apply(_count_qty).fillna(0).astype(int)
+
+    if len(df_items) > 0 and (df_items["ticket_qty"] == 0).mean() > 0.9:
+        enriched = []
+        for _, row in df_items.iterrows():
+            bid = row.get("booking_id")
+            if not bid:
+                enriched.append(0); continue
+            try:
+                d = fetch_booking_details(bid)
+                items = (d.get("booking", {}) or {}).get("items", [])
+                if isinstance(items, dict): items = list(items.values())
+                qty = 0
+                if isinstance(items, list):
+                    for it in items:
+                        if isinstance(it, dict): qty += _safe_int(it.get("qty", 0))
+                enriched.append(qty)
+            except Exception:
+                enriched.append(0)
+        df_items["ticket_qty"] = enriched
+
+    # Robust event_date extraction
+    def _extract_event_dt_from_items(items):
+        if isinstance(items, dict): items = list(items.values())
+        if not isinstance(items, list): return pd.NaT
+        cands = []
+        for it in items:
+            if not isinstance(it, dict): continue
+            for src in (it, it.get("date") if isinstance(it.get("date"), dict) else None):
+                if not isinstance(src, dict): continue
+                for key in ("start","start_date","date_start","from","event_date","date","datetime"):
+                    v = src.get(key)
+                    if v is None: continue
+                    dt = pd.to_datetime(v, unit="s", errors="coerce") if isinstance(v,(int,float)) else pd.to_datetime(v, errors="coerce")
+                    if pd.notna(dt): cands.append(dt)
+            v = it.get("date_desc")
+            if v:
+                dt = pd.to_datetime(v, errors="coerce")
+                if pd.notna(dt): cands.append(dt)
+        return min(cands) if cands else pd.NaT
+
+    df_items["event_date"] = df_items["items"].apply(_extract_event_dt_from_items)
+    if "date_desc" in df_items.columns:
+        df_items["event_date"] = df_items["event_date"].fillna(pd.to_datetime(df_items["date_desc"], errors="coerce"))
+    if "created_date" in df_items.columns:
+        df_items["event_date"] = df_items["event_date"].fillna(df_items["created_date"])
+    df_items["event_date"] = pd.to_datetime(df_items["event_date"], errors="coerce")
+
+    # Filter by EVENT date window
+    df_stock_base = df_items.loc[
+        (df_items["event_date"] >= pd.Timestamp(stock_start)) &
+        (df_items["event_date"] <= pd.Timestamp(stock_end))
+    ].copy()
+
+    df_stock_base["summary"] = df_stock_base["summary"].astype(str).str.strip()
+    is_tour = (
+        df_stock_base["summary"].str.contains(r"\btour\b", case=False, na=False) &
+        ~df_stock_base["summary"].str.contains(r"voucher|gift|guidebook|souvenir|meeting|room|hire", case=False, na=False)
+    )
+    df_stock_base = df_stock_base[is_tour].copy()
+
+    # Observed unit prices (always ex VAT)
+    product_prices = {}
+    df_tmp = df_stock_base[df_stock_base["ticket_qty"].fillna(0) > 0].copy()
+    if not df_tmp.empty:
+        df_tmp["unit_price"] = df_tmp.apply(
+            lambda r: ((r["total"] - r.get("Taxes", 0)) / r["ticket_qty"]) if r["ticket_qty"] else 0.0,
+            axis=1
+        )
+        product_prices = df_tmp.groupby("summary")["unit_price"].median().to_dict()
+
+    # Capacity & departures
+    TOUR_SEATS_PER_DEP = 12  # business rule
+
+    perday_tickets = (
+        df_stock_base
+        .assign(_day=df_stock_base["event_date"].dt.floor("D"))
+        .groupby(["summary", "_day"], as_index=False)["ticket_qty"]
+        .sum()
+    )
+    perday_tickets["deps_day"] = (perday_tickets["ticket_qty"] + TOUR_SEATS_PER_DEP - 1) // TOUR_SEATS_PER_DEP
+
+    deps_per_day_est = perday_tickets.groupby("summary")["deps_day"].mean().round(2).to_dict()
+    days_with_deps   = perday_tickets.groupby("summary")["deps_day"].count().to_dict()
+    total_deps       = perday_tickets.groupby("summary")["deps_day"].sum().to_dict()
+
+    # Debug table
+    debug_rows = []
+    for product in sorted(df_stock_base["summary"].dropna().unique()):
+        debug_rows.append({
+            "Product": product,
+            "Seats per Departure (detected)": TOUR_SEATS_PER_DEP,
+            "Capacity Source": "rule-fixed-12",
+            "Avg Departures/Day": float(deps_per_day_est.get(product, 0.0)),
+            "Days with Departures": int(days_with_deps.get(product, 0)),
+            "Total Departures Observed": int(total_deps.get(product, 0)),
+        })
+    debug_df = pd.DataFrame(debug_rows).sort_values(["Product"]).reset_index(drop=True)
+
+    with st.expander("🔎 Capacity & Departures (debug)"):
+        st.dataframe(debug_df, use_container_width=True)
+
+    # Stock table
+    rows = []
+    price_col_label = "Price (ex VAT) (£)"
+    lost_col_label  = "Potential Revenue Lost (ex VAT) (£)"
+
+    for product in sorted(df_stock_base["summary"].dropna().unique()):
+        pdfp = df_stock_base[df_stock_base["summary"] == product]
+        tickets_booked = int(pdfp["ticket_qty"].fillna(0).sum())
+
+        seats_per_dep = TOUR_SEATS_PER_DEP
+        avg_deps_per_day = float(deps_per_day_est.get(product, 0.0))
+        total_capacity = int(round(seats_per_dep * avg_deps_per_day * num_days))
+        available = max(total_capacity - tickets_booked, 0)
+
+        avg_price = float(product_prices.get(product, 0.0))
+        lost_revenue = available * avg_price
+
+        rows.append({
+            "Product": product,
+            "Booked Tickets": tickets_booked,
+            "Seats/Departure (detected)": seats_per_dep,
+            "Avg Departures/Day": round(avg_deps_per_day, 2),
+            "Capacity (Seats x Deps x Days)": total_capacity,
+            "Available": available,
+            price_col_label: round(avg_price, 2),
+            lost_col_label: round(lost_revenue, 2),
+        })
+
+    stock_df = pd.DataFrame(rows)
+
+    with st.expander("📋 Full Stock & Revenue Table"):
+        st.dataframe(stock_df, use_container_width=True)
+
+    left, right = st.columns(2)
+    with left:
+        fig_stock = px.bar(
+            stock_df,
+            x="Product",
+            y=["Booked Tickets", "Available"],
+            barmode="stack",
+            title="🎟️ Stock vs Tickets Booked (avg deps/day × days, 12 seats/dep)"
+        )
+        st.plotly_chart(fig_stock, use_container_width=True)
+
+    with right:
+        lost_sorted = stock_df.sort_values(lost_col_label, ascending=False).copy()
+        fig_lost = px.bar(
+            lost_sorted,
+            x=lost_col_label,
+            y="Product",
+            orientation="h",
+            title=f"💸 {lost_col_label} by Product",
+            text=lost_col_label
+        )
+        fig_lost.update_yaxes(categoryorder="array", categoryarray=list(lost_sorted["Product"]))
+        fig_lost.update_xaxes(tickprefix="£", tickformat=",")
+        fig_lost.update_traces(
+            texttemplate="£%{x:,.0f}",
+            hovertemplate="<b>%{y}</b><br>Lost: £%{x:,.2f}<extra></extra>"
+        )
+        st.plotly_chart(fig_lost, use_container_width=True)
+
+except Exception as e:
+    # Guard the rest of the app from any stock errors so the PDF button still renders
+    with st.expander("⚠️ Stock analysis failed (details)", expanded=False):
+        st.exception(e)
 
 # ================================
 # PDF build + Sidebar Download
@@ -964,6 +1178,7 @@ with st.sidebar:
     else:
         st.button("Download PDF (unavailable)", disabled=True, use_container_width=True)
         st.caption("PDF will appear once there’s data and the report is built.")
+
 
 
 
