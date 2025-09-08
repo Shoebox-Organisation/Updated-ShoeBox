@@ -233,6 +233,18 @@ if "applied_once" not in st.session_state: st.session_state.applied_once = False
 st.markdown("<h1 style='text-align: center;'>Shoebox Internal Operations Dashboard</h1>", unsafe_allow_html=True)
 st.markdown("---")
 
+# --- Quick Help (top banner) ---
+if not st.session_state.get("applied_once", False):
+    st.info(
+        "First click **Apply filters** in the sidebar on the left. "
+        "Then set your filters and press **Apply filters** once more."
+    )
+else:
+    st.caption(
+        "Tip: adjust filters any time in the sidebar and click **Apply filters**."
+    )
+
+
 with st.sidebar:
     logo = Path(__file__).parent / "shoebox.png"
     if logo.exists():
@@ -1202,6 +1214,7 @@ with st.sidebar:
     else:
         st.button("Download PDF (unavailable)", disabled=True, use_container_width=True)
         st.caption("PDF will appear once there’s data and the report is built.")
+
 
 
 
