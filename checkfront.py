@@ -60,10 +60,6 @@ ALLOW_INSECURE = str(_get_secret("ALLOW_INSECURE_SSL", "false")).lower() == "tru
 # (Only needed if you ever switch to api.checkfront.com host)
 CHECKFRONT_ACCOUNT = _get_secret("CHECKFRONT_ACCOUNT", "theshoebox")  # e.g., "theshoebox"
 
-# sanity check
-if not API_KEY or not API_TOKEN:
-    st.error("Missing API_KEY or API_TOKEN. Set them in Streamlit secrets or environment.")
-    st.stop()
 
 # --- TLS trust setup (Windows/macOS-friendly, works in cloud) ---
 USING_OS_TRUST = False
@@ -604,54 +600,6 @@ if date_basis == "Event date":
     view_event = df_event.loc[mask_e].copy()
 else:
     view_event = pd.DataFrame()
-
-# ---- Debug expanders (kept as in your original layout) ----
-with st.expander("🧩 Category filter debug"):
-    st.write("Selected category names:", selected_categories)
-    st.write("Selected category IDs:", [])
-    st.write("Selected product names:", selected_products)
-    st.write("Selected item IDs:", [])
-    st.write("Rows after server+client filter:", len(view_event if date_basis=="Event date" else view_booking))
-
-# Pick the basis for unified debugging
-using_event_basis = (date_basis == "Event date")
-raw_unified = raw_event if using_event_basis else raw_booking
-df_unified  = df_event  if using_event_basis else df_booking
-date_col    = "event_date" if using_event_basis else "created_date"
-
-with st.expander("🔎 Debug: Raw Bookings (before filters)", expanded=False):
-    raw_df = prepare_df(raw_unified)
-if not raw_df.empty:
-    st.write("created_date range in RAW:", raw_df["created_date"].min(), "→", raw_df["created_date"].max())
-
-    if raw_df.empty:
-        st.info("No rows returned from API.")
-    else:
-        wanted_cols = [
-            "booking_id","created_date","summary","status_name",
-            "customer_name","customer_email","total","tax_total"
-        ]
-        cols = [c for c in wanted_cols if c in raw_df.columns]
-        view_raw = raw_df.sort_values("created_date", ascending=False, na_position="last")[cols]
-        st.dataframe(view_raw, use_container_width=True)
-        st.caption(f"Total raw rows before filters: {len(raw_df)}")
-
-st.write("Raw rows from API:", len((raw_unified or {}).get("booking/index", {})))
-
-if not df_unified.empty:
-    if date_col not in df_unified.columns and using_event_basis:
-        st.write("Note: event_date not present yet.")
-    else:
-        lo = df_unified[date_col].min()
-        hi = df_unified[date_col].max()
-        lo_str = lo.strftime("%Y-%m-%d %H:%M") if pd.notna(lo) else "—"
-        hi_str = hi.strftime("%Y-%m-%d %H:%M") if pd.notna(hi) else "—"
-        st.write(f"{date_col} range in DF:", lo_str, "→", hi_str)
-
-    statuses = sorted(df_unified["status_name"].dropna().astype(str).unique().tolist())
-    st.write("Statuses present:", statuses)
-else:
-    st.write("No rows after current UI filters.")
 
 # Choose current view (drives KPIs & charts up to Stock section)
 if date_basis == "Event date":
@@ -1246,5 +1194,6 @@ with st.sidebar:
     else:
         st.button("Download PDF (unavailable)", disabled=True, use_container_width=True)
         st.caption("PDF will appear once there’s data and the report is built.")
+
 
 
