@@ -234,7 +234,10 @@ if "applied_once" not in st.session_state: st.session_state.applied_once = False
 # =========================
 
 # --- Header ---
-st.markdown("<h1 style='text-align: center;'>Shoebox Internal Operations Dashboard</h1>", unsafe_allow_html=True)
+st.markdown(
+    "<h1 style='text-align: center;'>Shoebox Internal Operations Dashboard</h1>",
+    unsafe_allow_html=True
+)
 st.markdown("---")
 
 # --- Quick Help (top banner) ---
@@ -245,19 +248,33 @@ if not st.session_state.get("applied_once", False):
         "Then set your filters and press **Apply filters** once more."
     )
 else:
-    help_box.caption("Tip: adjust filters any time in the sidebar and click **Apply filters**.")
+    help_box.caption(
+        "Tip: adjust filters any time in the sidebar and click **Apply filters**."
+    )
 
 # --- Sidebar ---
 with st.sidebar:
+    # Logo
     logo = Path(__file__).parent / "shoebox.png"
     if logo.exists():
         st.image(str(logo), width=180)
 
+    # Date pickers
     today = date.today()
-    start = st.date_input("Start Date", today - timedelta(days=30), key="start_date")
-    end   = st.date_input("End Date",   today + timedelta(days=60), key="end_date")
-    search = st.text_input("🔍 Search name, email or booking code", key="search_text").strip()
+    start = st.date_input(
+        "Start Date", today - timedelta(days=30), key="start_date"
+    )
+    end = st.date_input(
+        "End Date", today + timedelta(days=60), key="end_date"
+    )
 
+    # Free-text search
+    search = st.text_input(
+        "🔍 Search name, email or booking code",
+        key="search_text"
+    ).strip()
+
+    # Basis choice
     date_basis = st.selectbox(
         "Date basis for KPIs & charts",
         ["Booking date (created)", "Event date"],
@@ -265,9 +282,9 @@ with st.sidebar:
         key="date_basis"
     )
 
-    # Hard-coded catalog already built earlier
+    # Categories and products
     cat_to_products = catalog["cat_to_products"]
-    all_categories  = catalog["all_categories"]
+    all_categories = catalog["all_categories"]
 
     selected_categories = st.multiselect(
         "Category",
@@ -277,13 +294,16 @@ with st.sidebar:
         help="Choose one or more categories"
     )
 
+    # Build product pool from chosen categories
     product_pool = sorted({
         p for c in (selected_categories or all_categories)
         for p in cat_to_products.get(c, [])
     })
 
-    # prune invalid selections when category changes
-    st.session_state.item_ms = [p for p in st.session_state.item_ms if p in product_pool]
+    # Prune invalid selections
+    pruned_items = [p for p in st.session_state.item_ms if p in product_pool]
+    if pruned_items != st.session_state.item_ms:
+        st.session_state.item_ms = pruned_items
 
     selected_products = st.multiselect(
         "Items (in selected categories)",
@@ -293,7 +313,14 @@ with st.sidebar:
         help="Only items from the selected categories appear here"
     )
 
-    # Apply / Reset
+    # Placeholders for category/item IDs (if later needed in API calls)
+    selected_category_ids: list[str] = []
+    selected_item_ids: list[str] = []
+
+    # Status filter placeholder (filled after get_raw runs later)
+    status_filter_placeholder = st.empty()
+
+    # Apply / Reset buttons
     c1, c2 = st.columns(2)
     apply_clicked = c1.button("Apply filters", use_container_width=True)
     reset_clicked = c2.button("Reset", type="secondary", use_container_width=True)
@@ -308,6 +335,7 @@ with st.sidebar:
 
     if apply_clicked:
         st.session_state.applied_once = True
+
 
 # --- EARLY GATE (very important): do not fetch data until Apply has been clicked once ---
 if not st.session_state.get("applied_once", False):
@@ -1213,6 +1241,7 @@ with st.sidebar:
     else:
         st.button("Download PDF (unavailable)", disabled=True, use_container_width=True)
         st.caption("PDF will appear once there’s data and the report is built.")
+
 
 
 
