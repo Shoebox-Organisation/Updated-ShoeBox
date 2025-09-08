@@ -785,7 +785,7 @@ def render_extended_time_comparisons(view_df: pd.DataFrame, basis_series: pd.Ser
 render_extended_time_comparisons(current_view, basis_series, basis_label, AMOUNT_COL, AMOUNT_LABEL)
 
 # === QUARTERLY COMPARISON (APRIL → MARCH), not affected by the selected range ===
-st.markdown("### 📊 Quarterly Revenue (FY Apr–Mar)")
+st.markdown("### 📊 Quarterly Revenue (FY Apr–Mar) (Not affected by Filters")
 subtitle = "Not affected by filters, however will show entire year of the filtered data"
 
 # Financial year covering today, Apr -> Mar
@@ -1202,6 +1202,7 @@ with st.sidebar:
     else:
         st.button("Download PDF (unavailable)", disabled=True, use_container_width=True)
         st.caption("PDF will appear once there’s data and the report is built.")
+
 
 
 
