@@ -784,6 +784,88 @@ def render_extended_time_comparisons(view_df: pd.DataFrame, basis_series: pd.Ser
 # Call extended comparisons (same placement as your file)
 render_extended_time_comparisons(current_view, basis_series, basis_label, AMOUNT_COL, AMOUNT_LABEL)
 
+# === QUARTERLY COMPARISON (APRIL → MARCH), not affected by the selected range ===
+st.markdown("### 📊 Quarterly Revenue (FY Apr–Mar)")
+
+# Financial year covering today, Apr -> Mar
+today = date.today()
+if today.month < 4:
+    fy_start = date(today.year - 1, 4, 1)
+    fy_end   = date(today.year, 3, 31)
+else:
+    fy_start = date(today.year, 4, 1)
+    fy_end   = date(today.year + 1, 3, 31)
+
+if date_basis == "Event date":
+    # Pull event-dated bookings with items so we can derive event_date
+    raw_q = get_raw(fy_start, fy_end, include_items=True, filter_on="event")
+    df_q = prepare_df(raw_q).copy()
+    if "items" not in df_q.columns:
+        df_q["items"] = [[] for _ in range(len(df_q))]
+
+    # Local helper to extract event datetime (robust)
+    def _extract_event_dt_q(items):
+        if isinstance(items, dict): items = list(items.values())
+        if not isinstance(items, list): return pd.NaT
+        cands = []
+        for it in items:
+            if not isinstance(it, dict): continue
+            for src in (it, it.get("date") if isinstance(it.get("date"), dict) else None):
+                if not isinstance(src, dict): continue
+                for key in ("start","start_date","date_start","from","event_date","date","datetime"):
+                    v = src.get(key)
+                    if v is None: continue
+                    dt = (pd.to_datetime(v, unit="s", errors="coerce")
+                          if isinstance(v,(int,float)) else pd.to_datetime(v, errors="coerce"))
+                    if pd.notna(dt): cands.append(dt)
+            v = it.get("date_desc")
+            if v is not None:
+                dt = pd.to_datetime(v, errors="coerce")
+                if pd.notna(dt): cands.append(dt)
+        return min(cands) if cands else pd.NaT
+
+    df_q["event_date"] = df_q["items"].apply(_extract_event_dt_q)
+    if "date_desc" in df_q.columns:
+        df_q["event_date"] = df_q["event_date"].fillna(pd.to_datetime(df_q["date_desc"], errors="coerce"))
+
+    df_q = _apply_filters(df_q, selected_categories, selected_products, status_filter, search)
+    date_series_q = pd.to_datetime(df_q["event_date"], errors="coerce")
+else:
+    # Booking-created basis
+    raw_q = get_raw(fy_start, fy_end, include_items=False, filter_on="created")
+    df_q = _apply_filters(prepare_df(raw_q), selected_categories, selected_products, status_filter, search)
+    date_series_q = pd.to_datetime(df_q["created_date"], errors="coerce")
+
+# Build quarter totals across the FY
+df_q = df_q[date_series_q.notna()].copy()
+df_q["periodQ"] = date_series_q.dt.to_period("Q")
+
+q_index  = pd.period_range(start=fy_start, end=fy_end, freq="Q")
+q_series = df_q.groupby("periodQ")[AMOUNT_COL].sum()
+q_df     = q_series.reindex(q_index, fill_value=0).reset_index()
+q_df.columns = ["quarter", "total"]
+
+# Hide future quarters (beyond today)
+q_df.loc[(q_df["quarter"].dt.start_time > pd.Timestamp.today()), "total"] = pd.NA
+
+# Nice labels for Apr–Jun etc.
+def _fy_quarter_label(p):
+    m = p.start_time.month
+    return {4: "Q1 (Apr–Jun)", 7: "Q2 (Jul–Sep)", 10: "Q3 (Oct–Dec)", 1: "Q4 (Jan–Mar)"}\
+           .get(m, str(p))
+q_df["quarter"] = q_df["quarter"].apply(_fy_quarter_label)
+
+fy_label = f"FY {fy_start.year}/{fy_end.year}"
+fig_quarter = px.bar(
+    q_df, x="quarter", y="total",
+    title=f"Quarterly {AMOUNT_LABEL} Comparison ({'Event' if date_basis=='Event date' else 'Booking'} Date, {fy_label})",
+    text="total"
+)
+fig_quarter.update_traces(texttemplate="£%{y:,.0f}")
+fig_quarter.update_yaxes(tickprefix="£", tickformat=",")
+st.plotly_chart(fig_quarter, use_container_width=True)
+
+
 # ================================
 # Stock Availability + PDF Download
 # ================================
@@ -1119,6 +1201,7 @@ with st.sidebar:
     else:
         st.button("Download PDF (unavailable)", disabled=True, use_container_width=True)
         st.caption("PDF will appear once there’s data and the report is built.")
+
 
 
 
