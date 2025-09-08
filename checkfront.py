@@ -660,20 +660,6 @@ if current_view.empty:
     st.warning("No bookings match this window for the selected date basis and filters.")
     st.stop()
 
-with st.expander("🔎 Debug: All Bookings in Current View"):
-    st.dataframe(
-        current_view[[
-            "booking_id","created_date","summary","status_name",
-            "customer_name","customer_email", AMOUNT_COL
-        ]].sort_values("created_date", ascending=False),
-        use_container_width=True
-    )
-    st.caption(f"Total rows in current view: {len(current_view)}")
-
-if st.sidebar.button("🔄 Force refresh data"):
-    st.cache_data.clear()
-    st.cache_resource.clear()
-
 # --- KPIs ---
 total_bookings = len(current_view)
 amount_series = pd.to_numeric(current_view.get(AMOUNT_COL, 0), errors="coerce").fillna(0)
@@ -1062,21 +1048,6 @@ try:
     days_with_deps   = perday_tickets.groupby("summary")["deps_day"].count().to_dict()
     total_deps       = perday_tickets.groupby("summary")["deps_day"].sum().to_dict()
 
-    # Debug table
-    debug_rows = []
-    for product in sorted(df_stock_base["summary"].dropna().unique()):
-        debug_rows.append({
-            "Product": product,
-            "Seats per Departure (detected)": TOUR_SEATS_PER_DEP,
-            "Capacity Source": "rule-fixed-12",
-            "Avg Departures/Day": float(deps_per_day_est.get(product, 0.0)),
-            "Days with Departures": int(days_with_deps.get(product, 0)),
-            "Total Departures Observed": int(total_deps.get(product, 0)),
-        })
-    debug_df = pd.DataFrame(debug_rows).sort_values(["Product"]).reset_index(drop=True)
-
-    with st.expander("🔎 Capacity & Departures (debug)"):
-        st.dataframe(debug_df, use_container_width=True)
 
     # Stock table
     rows = []
@@ -1194,6 +1165,7 @@ with st.sidebar:
     else:
         st.button("Download PDF (unavailable)", disabled=True, use_container_width=True)
         st.caption("PDF will appear once there’s data and the report is built.")
+
 
 
 
