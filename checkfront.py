@@ -229,22 +229,25 @@ if "cat_ms" not in st.session_state:  st.session_state.cat_ms = []
 if "item_ms" not in st.session_state: st.session_state.item_ms = []
 if "applied_once" not in st.session_state: st.session_state.applied_once = False
 
+# =========================
+# Header + Quick Help + Sidebar (EARLY GATE)
+# =========================
+
 # --- Header ---
 st.markdown("<h1 style='text-align: center;'>Shoebox Internal Operations Dashboard</h1>", unsafe_allow_html=True)
 st.markdown("---")
 
 # --- Quick Help (top banner) ---
+help_box = st.empty()
 if not st.session_state.get("applied_once", False):
-    st.info(
+    help_box.info(
         "First click **Apply filters** in the sidebar on the left. "
         "Then set your filters and press **Apply filters** once more."
     )
 else:
-    st.caption(
-        "Tip: adjust filters any time in the sidebar and click **Apply filters**."
-    )
+    help_box.caption("Tip: adjust filters any time in the sidebar and click **Apply filters**.")
 
-
+# --- Sidebar ---
 with st.sidebar:
     logo = Path(__file__).parent / "shoebox.png"
     if logo.exists():
@@ -262,6 +265,7 @@ with st.sidebar:
         key="date_basis"
     )
 
+    # Hard-coded catalog already built earlier
     cat_to_products = catalog["cat_to_products"]
     all_categories  = catalog["all_categories"]
 
@@ -278,9 +282,8 @@ with st.sidebar:
         for p in cat_to_products.get(c, [])
     })
 
-    pruned_items = [p for p in st.session_state.item_ms if p in product_pool]
-    if pruned_items != st.session_state.item_ms:
-        st.session_state.item_ms = pruned_items
+    # prune invalid selections when category changes
+    st.session_state.item_ms = [p for p in st.session_state.item_ms if p in product_pool]
 
     selected_products = st.multiselect(
         "Items (in selected categories)",
@@ -290,17 +293,7 @@ with st.sidebar:
         help="Only items from the selected categories appear here"
     )
 
-    selected_category_ids: list[str] = []
-    selected_item_ids: list[str] = []
-
-    # Build status choices for the current date window
-    # (lightweight pull)
-    # We'll reuse get_raw() and prepare_df() defined below.
-    # This keeps your original layout/behaviour.
-    # temp_raw defined later, so we will set placeholders here and re-render on first run.
-
-    status_filter_placeholder = st.empty()
-
+    # Apply / Reset
     c1, c2 = st.columns(2)
     apply_clicked = c1.button("Apply filters", use_container_width=True)
     reset_clicked = c2.button("Reset", type="secondary", use_container_width=True)
@@ -315,6 +308,21 @@ with st.sidebar:
 
     if apply_clicked:
         st.session_state.applied_once = True
+
+# --- EARLY GATE (very important): do not fetch data until Apply has been clicked once ---
+if not st.session_state.get("applied_once", False):
+    st.stop()
+
+# From here on it's safe to do any data fetching (get_raw, etc.)
+
+# Build status choices only AFTER the gate, so first-load shows the help instead of a spinner
+temp_raw = get_raw(start, end, include_items=False, filter_on="created")
+temp_df  = prepare_df(temp_raw)
+status_choices = ["All"] + (sorted(temp_df["status_name"].dropna().unique()) if not temp_df.empty else [])
+
+with st.sidebar:
+    status_filter = st.selectbox("Filter by Booking Status", status_choices, index=0, key="status_sel")
+
 
 # Mirror old variables
 start = st.session_state.start_date
@@ -1214,6 +1222,7 @@ with st.sidebar:
     else:
         st.button("Download PDF (unavailable)", disabled=True, use_container_width=True)
         st.caption("PDF will appear once there’s data and the report is built.")
+
 
 
 
