@@ -613,9 +613,7 @@ else:
     basis_series = pd.to_datetime(current_view["created_date"], errors="coerce")
     basis_label = "Booking"
 
-with st.expander("🧪 Diagnostics: Current filter effect", expanded=False):
-    base_df = view_event.copy() if date_basis == "Event date" else view_booking.copy()
-    s = (search or "").strip().lower()
+
 
     def _ok_status(row): return (status_filter == "All") or (str(row.get("status_name","")) == status_filter)
     def _ok_search(row):
@@ -1111,10 +1109,7 @@ try:
         )
         st.plotly_chart(fig_lost, use_container_width=True)
 
-except Exception as e:
-    # Guard the rest of the app from any stock errors so the PDF button still renders
-    with st.expander("⚠️ Stock analysis failed (details)", expanded=False):
-        st.exception(e)
+
 
 
 # ================================
@@ -1165,6 +1160,7 @@ with st.sidebar:
     else:
         st.button("Download PDF (unavailable)", disabled=True, use_container_width=True)
         st.caption("PDF will appear once there’s data and the report is built.")
+
 
 
 
