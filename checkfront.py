@@ -613,52 +613,6 @@ else:
     basis_series = pd.to_datetime(current_view["created_date"], errors="coerce")
     basis_label = "Booking"
 
-with st.expander("🧪 Diagnostics: Current filter effect", expanded=False):
-    base_df = view_event.copy() if date_basis == "Event date" else view_booking.copy()
-    s = (search or "").strip().lower()
-
-    def _ok_status(row): return (status_filter == "All") or (str(row.get("status_name","")) == status_filter)
-    def _ok_search(row):
-        if not s: return True
-        return (
-            s in str(row.get("customer_name", "")).lower()
-            or s in str(row.get("customer_email", "")).lower()
-            or s in str(row.get("code", "")).lower()
-            or s in str(row.get("booking_id", "")).lower()
-        )
-    def _ok_categories(row):
-        if not selected_categories: return True
-        return any(catalog["name_to_cats"].get(part, set()) & set(selected_categories) for part in _parts(str(row.get("summary",""))))
-    def _ok_products(row):
-        if not selected_products: return True
-        sel_norm = {_norm_title(x) for x in selected_products}
-        return any(part in sel_norm for part in _parts(str(row.get("summary",""))))
-
-    diag = base_df.copy()
-    diag["ok_status"] = diag.apply(_ok_status, axis=1)
-    diag["ok_search"] = diag.apply(_ok_search, axis=1)
-    diag["ok_category"] = diag.apply(_ok_categories, axis=1)
-    diag["ok_product"] = diag.apply(_ok_products, axis=1)
-    checks = ["ok_status","ok_search","ok_category","ok_product"]
-    diag["INCLUDED"] = diag[checks].all(axis=1)
-    def _reason(r):
-        if r["INCLUDED"]: return ""
-        return ", ".join([c for c in checks if not r[c]])
-    diag["excluded_by"] = diag.apply(_reason, axis=1)
-
-    total = len(diag); kept = int(diag["INCLUDED"].sum()); dropped = total - kept
-    st.write(f"Total rows (basis={date_basis}): **{total}**  |  Included: **{kept}**  |  Dropped: **{dropped}**")
-
-    cols_to_show = ["booking_id","created_date","summary","status_name","customer_name","customer_email","total_ex_vat","excluded_by"]
-    existing_cols = [c for c in cols_to_show if c in diag.columns]
-    st.markdown("**Dropped rows (with reasons):**")
-    st.dataframe(diag.loc[~diag["INCLUDED"], existing_cols].sort_values(existing_cols[1] if len(existing_cols)>1 else "booking_id", ascending=False), use_container_width=True)
-    st.markdown("**Included rows (sample):**")
-    st.dataframe(diag.loc[diag["INCLUDED"], existing_cols].head(20), use_container_width=True)
-
-if current_view.empty:
-    st.warning("No bookings match this window for the selected date basis and filters.")
-    st.stop()
 
 # --- KPIs ---
 total_bookings = len(current_view)
@@ -1165,6 +1119,7 @@ with st.sidebar:
     else:
         st.button("Download PDF (unavailable)", disabled=True, use_container_width=True)
         st.caption("PDF will appear once there’s data and the report is built.")
+
 
 
 
