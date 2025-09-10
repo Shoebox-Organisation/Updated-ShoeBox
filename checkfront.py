@@ -549,16 +549,24 @@ def prepare_df(raw):
 
     return df
 
-# ---------- Client-side filters (unchanged behaviour) ----------
 def _apply_filters(dfx: pd.DataFrame,
                    selected_categories: list[str],
                    selected_products: list[str],
                    status_filter: str,
                    search: str) -> pd.DataFrame:
+    """
+    Client-side filters.
+    IMPORTANT CHANGE: match categories/products on the WHOLE normalized summary
+    (no token splitting) to avoid dropping items like
+    'The Matriarchs, Mayors & Merchants Tour'.
+    """
     dfx = dfx.copy()
 
+    # Ensure base columns exist
     if "summary" not in dfx.columns:     dfx["summary"] = ""
     if "status_name" not in dfx.columns: dfx["status_name"] = "Unknown"
+
+    # Ensure amount column exists
     if "total_ex_vat" not in dfx.columns:
         total_num = pd.to_numeric(dfx.get("total", 0.0), errors="coerce").fillna(0.0)
         if "tax_total" in dfx.columns:
@@ -570,9 +578,11 @@ def _apply_filters(dfx: pd.DataFrame,
         else:
             dfx["total_ex_vat"] = total_num.apply(ex_vat)
 
+    # ---- Status filter
     if status_filter != "All":
-        dfx = dfx[dfx["status_name"] == status_filter]
+        dfx = dfx[dfx["status_name"].astype(str) == str(status_filter)]
 
+    # ---- Search filter
     s = (search or "").strip().lower()
     if s:
         dfx = dfx[dfx.apply(
@@ -583,23 +593,29 @@ def _apply_filters(dfx: pd.DataFrame,
             axis=1
         )]
 
+    # ---- Category filter (WHOLE summary match)
     if selected_categories:
         sel_cats = set(selected_categories)
+
         def _has_selected_cat(summary: str) -> bool:
-            for part in _parts(summary):
-                cats = catalog["name_to_cats"].get(part, set())
-                if cats & sel_cats:
-                    return True
-            return False
+            # normalize the whole summary and look up its categories
+            ns = _norm_title(summary)
+            cats = catalog["name_to_cats"].get(ns, set())
+            return bool(cats & sel_cats)
+
         dfx = dfx[dfx["summary"].astype(str).apply(_has_selected_cat)]
 
+    # ---- Product filter (WHOLE summary match)
     if selected_products:
         selected_norm = {_norm_title(p) for p in selected_products}
+
         def _has_selected_product(summary: str) -> bool:
-            return any(part in selected_norm for part in _parts(summary))
+            return _norm_title(summary) in selected_norm
+
         dfx = dfx[dfx["summary"].astype(str).apply(_has_selected_product)]
 
     return dfx
+
 
 # ---------- Load datasets (same layout/logic) ----------
 # Build status choices now that functions exist
@@ -1280,6 +1296,7 @@ with st.sidebar:
     else:
         st.button("Download PDF (unavailable)", disabled=True, use_container_width=True)
         st.caption("PDF will appear once there’s data and the report is built.")
+
 
 
 
