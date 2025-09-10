@@ -180,7 +180,7 @@ def build_hardcoded_catalog() -> dict:
         ],
         "Norwich’s Hidden Street": [
             "Norwich’s Hidden Street Tour",
-            "Norwich’s Hidden Street Tour – Family Fun",
+            "Norwich’s Hidden Street Tour – Family Fun!",
             "Hidden Street Tour Souvenir Guidebook, Norwich's Hidden Street Tour",
         ],
         "Norwich Walking Tours": [
@@ -360,10 +360,30 @@ if not st.session_state.applied_once and "data_ready" not in st.session_state:
     st.stop()
 st.session_state.data_ready = True
 
+# ---- one-time UI logging (prevents spam) ----
+def _log_once(key: str, text: str, level: str = "caption"):
+    seen = st.session_state.setdefault("_once_logs", set())
+    if key in seen:
+        return
+    seen.add(key)
+    if level == "warning":
+        st.warning(text)
+    elif level == "error":
+        st.error(text)
+    elif level == "info":
+        st.info(text)
+    else:
+        st.caption(text)
+
+
 # --- Auth & API helpers using API_BASE ---
 def fetch_bookings(start_date, end_date, limit=250, include_items=False, max_pages=None,
                    filter_on="created", category_ids=None, item_ids=None):
-    """Fetch all pages (newest-first)."""
+    """
+    Fetch all pages (newest-first) with quiet logging and fast 2-phase fallback.
+    If expand=items causes 500s, we do ONE light attempt, then switch to the stable
+    2-phase path (index without expand -> per-booking detail).
+    """
     headers = get_auth_header()
     category_ids = list(category_ids or [])
     item_ids = list(item_ids or [])
@@ -372,10 +392,13 @@ def fetch_bookings(start_date, end_date, limit=250, include_items=False, max_pag
         r = SESSION.get(BOOKING_INDEX_URL, headers=headers, params=params)
         if not r.ok:
             msg = f"{r.status_code} {r.reason} — {r.url}"
-            st.error(f"API error: {msg}\n\n{r.text[:500]}")
+            # keep this as error (but once) so you can see first failure
+            _log_once("api_error", f"API error: {msg}", level="warning")
+            # don’t dump body repeatedly; we still raise for control-flow
             r.raise_for_status()
         return r.json()
 
+    # Base params
     common = {"limit": limit, "sort": "created_date", "dir": "desc"}
     if include_items:
         common["expand"] = "items"
@@ -384,30 +407,32 @@ def fetch_bookings(start_date, end_date, limit=250, include_items=False, max_pag
     if item_ids:
         common["item_id[]"] = item_ids
 
-    # Try server-side windows in this order, else fallback to newest-first:
+    # Lighten heavy requests
+    if include_items and common.get("limit", 250) > 100:
+        common["limit"] = 100
+
+    # Build date params
     def _params_for(field):
         if filter_on == "created":
             return common | {
                 f"{field}[min]": start_date.isoformat(),
-                f"{field}[max]": end_date.isoformat()
+                f"{field}[max]": end_date.isoformat(),
             }
         else:
             return common | {
                 "start_date[min]": start_date.isoformat(),
-                "start_date[max]": end_date.isoformat()
+                "start_date[max]": end_date.isoformat(),
             }
 
-    param_options = [
+    param_try_once = [
         _params_for("created_at"),
         _params_for("created_date"),
-        common,
     ]
 
     def _page_all(params):
         out, seen, page = [], set(), 1
         while True:
-            q = params.copy()
-            q["page"] = page
+            q = params.copy(); q["page"] = page
             data = _get(q)
             rows = list((data.get("booking/index") or {}).values())
             if not rows:
@@ -415,40 +440,104 @@ def fetch_bookings(start_date, end_date, limit=250, include_items=False, max_pag
             for b in rows:
                 bid = b.get("booking_id")
                 if bid and bid not in seen:
-                    seen.add(bid)
-                    out.append(b)
-            if len(rows) < params["limit"]:
+                    seen.add(bid); out.append(b)
+            if len(rows) < params.get("limit", 100):
                 break
             page += 1
             if max_pages is not None and page > max_pages:
                 break
         return out
 
-    # --- FIXED LOOP ---
+    # ---------- two-phase fallback ----------
+    @st.cache_data(ttl=600, show_spinner=False)
+    def _get_detail_cached(bid: str | int):
+        return fetch_booking_details(bid)
+
+    def _two_phase_enrich():
+        _log_once("two_phase", "↪️ Switched to stable 2-phase: index without items, then per-booking details.", "info")
+        # index without expand, chunk by 1 day to avoid server strain
+        days = pd.date_range(start=start_date, end=end_date, freq="1D").date
+        all_rows, seen = [], set()
+        for d in days:
+            if filter_on == "created":
+                day_params = {"sort": "created_date", "dir": "desc", "limit": 100,
+                              "created_at[min]": pd.Timestamp(d).date().isoformat(),
+                              "created_at[max]": pd.Timestamp(d).date().isoformat()}
+            else:
+                day_params = {"sort": "created_date", "dir": "desc", "limit": 100,
+                              "start_date[min]": pd.Timestamp(d).date().isoformat(),
+                              "start_date[max]": pd.Timestamp(d).date().isoformat()}
+            if category_ids: day_params["category_id[]"] = category_ids
+            if item_ids:     day_params["item_id[]"]     = item_ids
+            # force no expand
+            day_params.pop("expand", None)
+
+            try:
+                for b in _page_all(day_params):
+                    bid = b.get("booking_id")
+                    if bid and bid not in seen:
+                        seen.add(bid); all_rows.append(b)
+            except Exception as e:
+                _log_once(f"two_phase_day_{d}", f"…skipped {d} (index error: {type(e).__name__})")
+
+        # Enrich per booking (cached)
+        enriched = []
+        for b in all_rows:
+            bid = b.get("booking_id")
+            if not bid:
+                enriched.append(b); continue
+            try:
+                detail = _get_detail_cached(str(bid)) or {}
+                items = (detail.get("booking", {}).get("items")
+                         or detail.get("items") or [])
+                bb = dict(b); bb["items"] = items
+                enriched.append(bb)
+            except Exception as e:
+                _log_once(f"detail_{bid}", f"…detail failed for {bid} ({type(e).__name__})")
+                enriched.append(b)
+        return enriched
+    # ---------------------------------------
+
     rows = []
-    for params in param_options:
+    if include_items:
+        # Do just ONE light attempt with expand=items. On any HTTP 5xx or network error,
+        # switch to 2-phase immediately (no spammy retries).
         try:
-            rows = _page_all(params)
-            break  # success
+            light = _params_for("created_date")
+            light["limit"] = min(50, int(light.get("limit", 50)))
+            rows = _page_all(light)
         except requests.HTTPError as e:
             code = e.response.status_code if e.response is not None else None
-            if code in (400, 403, 500, 502, 503, 504):
-                st.caption(f"⚠️ Server rejected params ({code}). Trying fallback…")
-                continue  # try next strategy
-            raise  # unexpected error
+            if code and 500 <= code < 600:
+                rows = _two_phase_enrich()
+            else:
+                # 400/403 etc — try without expand
+                rows = _two_phase_enrich()
         except requests.RequestException:
-            st.caption("⚠️ Network error while fetching; trying fallback…")
-            continue
+            rows = _two_phase_enrich()
+    else:
+        # No items needed: try normal index (quiet, no spam)
+        for params in param_try_once:
+            try:
+                rows = _page_all(params)
+                break
+            except requests.HTTPError as e:
+                code = e.response.status_code if e.response is not None else None
+                _log_once(f"idx_err_{code}", f"⚠️ Index HTTP error {code}; trying next window…")
+                continue
+            except requests.RequestException as e:
+                _log_once("idx_net", f"⚠️ Network error listing index: {type(e).__name__}")
+                continue
+        if not rows:
+            # absolute last resort
+            base = {"sort": "created_date", "dir": "desc", "limit": min(100, common.get("limit", 100))}
+            rows = _page_all(base)
 
-    # Last-resort fallback
-    if not rows:
-        rows = _page_all(common)
-
-    # Client-side created-date filter as a safety net
+    # Client-side created-date safety net
     def _created_ts(b):
         for k in ("created_at", "created_date", "created", "date_created", "timestamp_created"):
             v = b.get(k)
-            if v is None:
+            if v is None: 
                 continue
             ts = pd.to_datetime(v, unit="s", errors="coerce")
             if pd.isna(ts):
@@ -467,6 +556,7 @@ def fetch_bookings(start_date, end_date, limit=250, include_items=False, max_pag
             filtered.append(b)
 
     return {"booking/index": {i: b for i, b in enumerate(filtered)}}
+
 
 
 def fetch_booking_details(booking_id: str | int):
@@ -492,15 +582,20 @@ def categorise_product(summary: str) -> str:
     ns = _norm_title(summary)
     if not ns:
         return "Other"
-    if any(p in TOURS_ALLOWLIST for p in _parts(summary)):
+    parts = _parts(summary)
+
+    # If ANY part is a known tour → Tour
+    if any(p in TOURS_ALLOWLIST for p in parts):
         return "Tour"
-    s = ns
-    if re.search(r"\broom\b|meeting|hire", s): return "Room Hire"
-    if "group" in s: return "Group"
-    if "voucher" in s or "gift" in s: return "Voucher"
-    if "guidebook" in s or "souvenir" in s or "merch" in s: return "Merchandise"
-    if "fee" in s or "reschedul" in s or "cancell" in s or "admin" in s: return "Fee"
+
+    # Otherwise fall back to other rules
+    if re.search(r"\broom\b|meeting|hire", ns): return "Room Hire"
+    if "group" in ns: return "Group"
+    if "voucher" in ns or "gift" in ns: return "Voucher"
+    if "guidebook" in ns or "souvenir" in ns or "merch" in ns: return "Merchandise"
+    if "fee" in ns or "reschedul" in ns or "cancell" in ns or "admin" in ns: return "Fee"
     return "Other"
+
 
 @st.cache_data(ttl=300)
 def prepare_df(raw):
@@ -543,12 +638,30 @@ def prepare_df(raw):
     else:
         df["total_ex_vat"] = df["total"].fillna(0.0).apply(ex_vat)
 
+    # 🔽 INSERT THE GUIDEBOOK FIX HERE 🔽
+    def _sum_guidebook_from_items(items) -> float:
+        ...
+    if "items" in df.columns:
+        gb_exvat = df["items"].apply(_sum_guidebook_from_items).astype(float)
+        df["total_ex_vat"] = (df["total_ex_vat"].fillna(0.0) - gb_exvat).clip(lower=0.0)
+    else:
+        has_guide = df["summary"].str.contains("guidebook", case=False, na=False)
+        has_tour  = df["summary"].apply(lambda s: any(p in TOURS_ALLOWLIST for p in _parts(s)))
+        df.loc[has_guide & has_tour, "product_category"] = "Tour"
+    # 🔼 END OF GUIDEBOOK FIX 🔼
+
     if "booking_id" in df.columns:
         df = df.drop_duplicates(subset="booking_id", keep="last")
     else:
         df = df.drop_duplicates()
 
     return df
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def prepared_df_cached(raw_json):
+    return prepare_df(raw_json)
+
 
 def _apply_filters(dfx: pd.DataFrame,
                    selected_categories: list[str],
@@ -634,53 +747,140 @@ AMOUNT_LABEL = "Amount (ex VAT)"
 start_ts = pd.Timestamp(start)
 end_excl = pd.Timestamp(end) + pd.Timedelta(days=1)
 
+# --- Booking basis (created) ---
 raw_booking = get_raw(start, end, include_items=False, filter_on="created",
                       category_ids=[], item_ids=[])
-df_booking  = prepare_df(raw_booking)
-df_booking  = _apply_filters(df_booking, selected_categories, selected_products, status_filter, search)
+df_booking_raw = prepared_df_cached(raw_booking)           # <-- keep raw
+df_booking      = df_booking_raw.copy()
+df_booking      = _apply_filters(df_booking, selected_categories, selected_products, status_filter, search)
 
 cd_booking  = pd.to_datetime(df_booking["created_date"], errors="coerce")
 mask_b      = cd_booking.notna() & (cd_booking >= start_ts) & (cd_booking < end_excl)
 view_booking = df_booking.loc[mask_b].copy()
 
-# Event-basis (if used)
 if date_basis == "Event date":
-    raw_event = get_raw(start, end, include_items=True, filter_on="event",
-                        category_ids=[], item_ids=[])
-    df_event  = prepare_df(raw_event)
+    # Decide whether to pull items
+    need_items_for_event = False  # or True if you want item-level event dates
+
+    raw_event = get_raw(
+        start, end,
+        include_items=need_items_for_event,
+        filter_on="event",
+        category_ids=[], item_ids=[]
+    )
+
+    # Keep raw (unfiltered) copy
+    df_event_raw = prepare_df(raw_event)
+
+    # Copy for processing
+    df_event = df_event_raw.copy()
+
+    # ... run your event_date enrichment on df_event here ...
+
+    # Apply filters
+    df_event = _apply_filters(
+        df_event,
+        selected_categories,
+        selected_products,
+        status_filter,
+        search
+    )
+
+    ed_event = pd.to_datetime(df_event["event_date"], errors="coerce")
+    mask_e   = ed_event.notna() & (ed_event >= start_ts) & (ed_event < end_excl)
+    view_event = df_event.loc[mask_e].copy()
+
+
+    # Ensure a column exists for later logic
     if "items" not in df_event.columns:
         df_event["items"] = [[] for _ in range(len(df_event))]
-    # Robust extraction
-    def _extract_event_dt_from_items(items):
-        if isinstance(items, dict): items = list(items.values())
-        if not isinstance(items, list): return pd.NaT
-        cands = []
-        for it in items:
-            if not isinstance(it, dict): continue
-            for src in (it, it.get("date") if isinstance(it.get("date"), dict) else None):
-                if not isinstance(src, dict): continue
-                for key in ("start","start_date","date_start","from","event_date","date","datetime"):
-                    v = src.get(key)
-                    if v is None: continue
-                    dt = pd.to_datetime(v, unit="s", errors="coerce") if isinstance(v,(int,float)) else pd.to_datetime(v, errors="coerce")
-                    if pd.notna(dt): cands.append(dt)
-            v = it.get("date_desc")
-            if v:
-                dt = pd.to_datetime(v, errors="coerce")
-                if pd.notna(dt): cands.append(dt)
-        return min(cands) if cands else pd.NaT
 
-    df_event["event_date"] = df_event["items"].apply(_extract_event_dt_from_items)
-    if "date_desc" in df_event.columns:
-        df_event["event_date"] = df_event["event_date"].fillna(pd.to_datetime(df_event["date_desc"], errors="coerce"))
-    df_event["event_date"] = pd.to_datetime(df_event["event_date"], errors="coerce")
+    # Robust extraction — prefers item dates if present (won’t be for this first pass),
+    # then falls back to date_desc or other date-ish fields in index rows.
+    def _extract_event_dt_from_row(row):
+        # A) Try items (if present later during selective enrichment)
+        items = row.get("items", [])
+        if isinstance(items, dict):
+            items = list(items.values())
+        if isinstance(items, list) and items:
+            cands = []
+            for it in items:
+                if not isinstance(it, dict):
+                    continue
+                for src in (it, it.get("date") if isinstance(it.get("date"), dict) else None):
+                    if not isinstance(src, dict):
+                        continue
+                    for key in ("start","start_date","date_start","from","event_date","date","datetime"):
+                        v = src.get(key)
+                        if v is None:
+                            continue
+                        dt = pd.to_datetime(v, unit="s", errors="coerce") if isinstance(v,(int,float)) else pd.to_datetime(v, errors="coerce")
+                        if pd.notna(dt):
+                            cands.append(dt)
+                v = it.get("date_desc")
+                if v:
+                    dt = pd.to_datetime(v, errors="coerce")
+                    if pd.notna(dt):
+                        cands.append(dt)
+            if cands:
+                return min(cands)
 
-    df_event  = _apply_filters(df_event, selected_categories, selected_products, status_filter, search)
-    ed_event  = pd.to_datetime(df_event["event_date"], errors="coerce")
-    mask_e    = ed_event.notna() & (ed_event >= start_ts) & (ed_event < end_excl)
+        # B) Fall back to index-level hints (fast path)
+        for k in ("date_desc","event_date","start_date","date"):
+            if k in row and pd.notna(row[k]):
+                dt = pd.to_datetime(row[k], errors="coerce")
+                if pd.notna(dt):
+                    return dt
+
+        return pd.NaT
+
+    # Compute event_date from what we have now (no items)
+    df_event["event_date"] = df_event.apply(_extract_event_dt_from_row, axis=1)
+
+    # If too many are still missing, we’ll selectively enrich ONLY those rows
+    missing_mask = df_event["event_date"].isna()
+    missing_count = int(missing_mask.sum())
+    total_count   = int(len(df_event))
+    pct_missing   = (missing_count / total_count * 100) if total_count else 0.0
+
+    if missing_count and pct_missing > 40:
+        # 2) Selective enrichment just for rows still missing an event date.
+        #    We’ll fetch booking details (cached) and re-run extraction on those rows only.
+        st.caption(f"↪️ Enriching {missing_count} bookings (missing event_date) with detail calls…")
+
+        # Small helper that’s cached in fetch_bookings; re-use detail endpoint here directly:
+        def _fetch_detail(bid):
+            try:
+                return fetch_booking_details(bid)
+            except Exception:
+                return {}
+
+        # Only touch the missing ones (cap to avoid long waits when API is sick)
+        MAX_ENRICH = 250
+        to_fix = df_event.loc[missing_mask].head(MAX_ENRICH).copy()
+
+        new_items = {}
+        for bid in to_fix.get("booking_id", []):
+            d = _fetch_detail(bid)
+            items = (d.get("booking", {}).get("items")
+                     or d.get("items") or [])
+            new_items[bid] = items
+
+        # Attach enriched items and recompute event_date for those rows
+        if new_items:
+            idx = df_event["booking_id"].map(new_items.get).notna()
+            df_event.loc[idx, "items"] = df_event.loc[idx, "booking_id"].map(new_items.get)
+            df_event.loc[idx, "event_date"] = df_event.loc[idx].apply(_extract_event_dt_from_row, axis=1)
+
+    # Apply filters and windowing
+    df_event = _apply_filters(df_event, selected_categories, selected_products, status_filter, search)
+    ed_event = pd.to_datetime(df_event["event_date"], errors="coerce")
+    mask_e   = ed_event.notna() & (ed_event >= start_ts) & (ed_event < end_excl)
     view_event = df_event.loc[mask_e].copy()
+
 else:
     view_event = pd.DataFrame()
+
 
 # Choose current view (drives KPIs & charts up to Stock section)
 if date_basis == "Event date":
@@ -693,6 +893,200 @@ else:
     current_view = view_booking.copy()
     basis_series = pd.to_datetime(current_view["created_date"], errors="coerce")
     basis_label = "Booking"
+    
+# ======================= EXCLUSION EXPLAINER (with booking `code`) =======================
+def _coerce_ts(s):
+    s = pd.to_datetime(s, errors="coerce")
+    try:
+        if getattr(s.dt, "tz", None) is not None:
+            s = s.dt.tz_localize(None)
+    except Exception:
+        pass
+    return s
+
+def _category_lookup_for_summary(summary: str) -> set[str]:
+    ns = _norm_title(summary)
+    whole = catalog["name_to_cats"].get(ns, set())
+    return whole or set()
+
+def explain_exclusions(base_df: pd.DataFrame,
+                       basis: str,
+                       start_date: date,
+                       end_date: date,
+                       status_filter: str,
+                       selected_categories: list[str],
+                       selected_products: list[str],
+                       search_text: str) -> pd.DataFrame:
+    """
+    Builds a row-per-booking table mirroring your filters and
+    annotates the first exclusion reason. Includes BOTH booking_id (numeric)
+    and code (alphanumeric).
+    """
+    df = base_df.copy()
+
+    # Basis column + range mask
+    basis_col = "event_date" if basis == "Event date" else "created_date"
+    ts = _coerce_ts(df.get(basis_col))
+    start_ts = pd.Timestamp(start_date)
+    end_excl = pd.Timestamp(end_date) + pd.Timedelta(days=1)
+
+    M_ts_ok = ts.notna()
+    M_range = M_ts_ok & (ts >= start_ts) & (ts < end_excl)
+
+    # Status mask
+    if status_filter != "All":
+        M_status = df["status_name"].astype(str) == str(status_filter)
+    else:
+        M_status = pd.Series(True, index=df.index)
+
+    # Search mask
+    s_txt = (search_text or "").strip().lower()
+    if s_txt:
+        M_search = df.apply(
+            lambda r: s_txt in str(r.get("customer_name","")).lower()
+                   or s_txt in str(r.get("customer_email","")).lower()
+                   or s_txt in str(r.get("code","")).lower()
+                   or s_txt in str(r.get("booking_id","")).lower(),
+            axis=1
+        )
+    else:
+        M_search = pd.Series(True, index=df.index)
+
+    # Category mask (whole-summary matching)
+    if selected_categories:
+        sel_cats = set(selected_categories)
+        M_cat = df["summary"].astype(str).apply(
+            lambda s: bool(_category_lookup_for_summary(s) & sel_cats)
+        )
+    else:
+        M_cat = pd.Series(True, index=df.index)
+
+    # Product mask (whole-summary matching)
+    if selected_products:
+        sel_products = {_norm_title(p) for p in selected_products}
+        M_prod = df["summary"].astype(str).apply(
+            lambda s: _norm_title(s) in sel_products
+        )
+    else:
+        M_prod = pd.Series(True, index=df.index)
+
+    # Final keep
+    KEEP = M_ts_ok & M_range & M_status & M_search & M_cat & M_prod
+
+    # First exclusion reason
+    reasons = []
+    for i in df.index:
+        if KEEP.loc[i]:
+            reasons.append("")
+            continue
+        if not M_ts_ok.loc[i]:
+            reasons.append(f"no {basis_col}")
+        elif not M_range.loc[i]:
+            reasons.append("outside date range")
+        elif not M_status.loc[i]:
+            reasons.append(f"status != '{status_filter}'")
+        elif not M_search.loc[i]:
+            reasons.append("search mismatch")
+        elif not M_cat.loc[i]:
+            reasons.append("category mismatch")
+        elif not M_prod.loc[i]:
+            reasons.append("product mismatch")
+        else:
+            reasons.append("excluded (other)")
+
+    # Safe accessors
+    _blank_series = pd.Series("", index=df.index, dtype="object")
+    out = pd.DataFrame({
+        "booking_id": df.get("booking_id", _blank_series).astype(str),     # numeric
+        "code":       df.get("code", _blank_series).astype(str),           # <-- NEW: alphanumeric booking code
+        "summary":    df.get("summary", _blank_series).astype(str),
+        "summary_norm": df.get("summary", _blank_series).astype(str).map(_norm_title),
+        "app_categories_for_summary": df.get("summary", _blank_series).astype(str).map(
+            lambda s: ", ".join(sorted(_category_lookup_for_summary(s))) or "∅"
+        ),
+        "status_name": df.get("status_name", _blank_series).astype(str),
+        "created_date": _coerce_ts(df.get("created_date")),
+        "event_date":   _coerce_ts(df.get("event_date")),
+        f"{basis_col}_in_range": M_range.values,
+        "status_ok":  M_status.values,
+        "search_ok":  M_search.values,
+        "category_ok": M_cat.values,
+        "product_ok":  M_prod.values,
+        "kept": KEEP.values,
+        "exclusion_reason": reasons,
+    }, index=df.index)
+
+    return out
+# ==================================================================
+
+with st.expander("🧭 Which bookings were excluded? (with booking code)", expanded=True):
+    # IMPORTANT: start from RAW data (unfiltered)
+    base_df = (df_event_raw.copy() if date_basis == "Event date" else df_booking_raw.copy())
+
+    # Toggle: show only excluded, only kept, or all
+    view_mode = st.radio(
+        "View",
+        options=["Only excluded", "Only kept", "All (annotated)"],
+        index=0,
+        horizontal=True
+    )
+
+    # Optional focus filters
+    colA, colB = st.columns(2)
+    focus_tour = colA.selectbox(
+        "Focus on a tour (optional)",
+        options=["(All)"] + sorted(base_df["summary"].dropna().unique().tolist()),
+        index=0
+    )
+    focus_codes = colB.text_area(
+        "Filter by booking codes (one per line, optional)",
+        value="",
+        placeholder="e.g.\nXKTX-010825\nALNZ-010825"
+    ).strip()
+
+    # Build explanation table (includes `code`)
+    df_explain = explain_exclusions(
+        base_df, date_basis, start, end,
+        status_filter, selected_categories, selected_products, search
+    )
+
+    # Apply focus filters (display-only)
+    if focus_tour != "(All)":
+        df_explain = df_explain[df_explain["summary"] == focus_tour]
+
+    if focus_codes:
+        wanted_codes = {c.strip() for c in focus_codes.splitlines() if c.strip()}
+        df_explain = df_explain[df_explain["code"].isin(wanted_codes)]
+
+    # Apply view mode
+    if view_mode == "Only excluded":
+        df_explain = df_explain[df_explain["kept"] == False]
+    elif view_mode == "Only kept":
+        df_explain = df_explain[df_explain["kept"] == True]
+    # else "All": keep as-is
+
+    # Order: excluded first, then kept; stable within groups
+    df_explain = df_explain.sort_values(["kept", "exclusion_reason", "created_date"], ascending=[True, True, True])
+
+    st.caption("Tip: paste booking *codes* above (e.g., XKTX-010825) to check specific records.")
+    st.dataframe(
+        df_explain[
+            ["booking_id", "code", "summary", "summary_norm", "app_categories_for_summary",
+             "status_name", "created_date", "event_date",
+             f"{'event_date' if date_basis=='Event date' else 'created_date'}_in_range",
+             "status_ok", "category_ok", "product_ok", "kept", "exclusion_reason"]
+        ],
+        use_container_width=True, height=440
+    )
+
+    st.download_button(
+        "⬇️ Download exclusions (includes booking CODE)",
+        data=df_explain.to_csv(index=False).encode("utf-8-sig"),
+        file_name=f"exclusions_with_code_{'event' if date_basis=='Event date' else 'booking'}_{start}_{end}.csv",
+        mime="text/csv",
+        use_container_width=True
+    )
+
 
 # ---------- DEBUG HELPERS ----------
 def _coerce_ts(s):
@@ -905,16 +1299,27 @@ with st.expander("🔎 Bookings pulled from API (current basis + range)", expand
             except Exception as e:
                 st.error(f"Detail fetch failed for {bid}: {e}")
 
+def _series_or_zeros(df: pd.DataFrame, col: str, dtype=float) -> pd.Series:
+    """Return a numeric Series for df[col]; 0s if the column is missing."""
+    if col in df.columns:
+        return pd.to_numeric(df[col], errors="coerce").fillna(0).astype(dtype)
+    return pd.Series(0, index=df.index, dtype=dtype)
 
 
 
 # --- KPIs ---
 total_bookings = len(current_view)
-amount_series = pd.to_numeric(current_view.get(AMOUNT_COL, 0), errors="coerce").fillna(0)
-total_amount  = amount_series.sum()
+
+amount_series = _series_or_zeros(current_view, AMOUNT_COL, dtype=float)
+total_amount  = float(amount_series.sum())
 avg_booking   = (total_amount / total_bookings) if total_bookings else 0.0
-paid_pct    = (pd.to_numeric(current_view.get("paid_total", 0), errors="coerce").fillna(0) > 0).mean() * 100
-repeat_rate = current_view["customer_email"].duplicated().mean() * 100 if "customer_email" in current_view.columns else 0.0
+
+paid_series = _series_or_zeros(current_view, "paid_total", dtype=float)
+paid_pct    = ((paid_series > 0).mean() * 100.0) if len(current_view) else 0.0
+
+repeat_rate = (current_view["customer_email"].duplicated().mean() * 100.0
+               if "customer_email" in current_view.columns and len(current_view)
+               else 0.0)
 
 kpi_data = {
     "Total Bookings": total_bookings,
@@ -1297,6 +1702,18 @@ with st.sidebar:
     else:
         st.button("Download PDF (unavailable)", disabled=True, use_container_width=True)
         st.caption("PDF will appear once there’s data and the report is built.")
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 
