@@ -181,6 +181,7 @@ def build_hardcoded_catalog() -> dict:
         "Norwich’s Hidden Street": [
             "Norwich’s Hidden Street Tour",
             "Norwich’s Hidden Street Tour – Family Fun",
+            "Hidden Street Tour Souvenir Guidebook, Norwich's Hidden Street Tour",
         ],
         "Norwich Walking Tours": [
             "The TIPSY Tavern Trail Tour",
@@ -1296,6 +1297,7 @@ with st.sidebar:
     else:
         st.button("Download PDF (unavailable)", disabled=True, use_container_width=True)
         st.caption("PDF will appear once there’s data and the report is built.")
+
 
 
 
