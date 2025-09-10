@@ -90,6 +90,9 @@ def _norm_title(s: str) -> str:
     s = unicodedata.normalize("NFKC", str(s)).strip().lower()
     s = re.sub(r"\s+", " ", s)      # collapse spaces
     s = s.replace("–", "-")         # en-dash → hyphen
+    s = s.replace("—", "-")         # em-dash → hyphen
+    s = s.replace("’", "'")         # curly apostrophe → straight
+    s = s.replace("“", '"').replace("”", '"')  # curly quotes → straight
     return s
 
 
@@ -373,18 +376,25 @@ def fetch_bookings(start_date, end_date, limit=250, include_items=False, max_pag
         return r.json()
 
     common = {"limit": limit, "sort": "created_date", "dir": "desc"}
-    if include_items:               common["expand"]        = "items"
-    if category_ids:                common["category_id[]"] = category_ids
-    if item_ids:                    common["item_id[]"]     = item_ids
+    if include_items:
+        common["expand"] = "items"
+    if category_ids:
+        common["category_id[]"] = category_ids
+    if item_ids:
+        common["item_id[]"] = item_ids
 
     # Try server-side windows in this order, else fallback to newest-first:
     def _params_for(field):
         if filter_on == "created":
-            return common | {f"{field}[min]": start_date.isoformat(),
-                             f"{field}[max]": end_date.isoformat()}
+            return common | {
+                f"{field}[min]": start_date.isoformat(),
+                f"{field}[max]": end_date.isoformat()
+            }
         else:
-            return common | {"start_date[min]": start_date.isoformat(),
-                             "start_date[max]": end_date.isoformat()}
+            return common | {
+                "start_date[min]": start_date.isoformat(),
+                "start_date[max]": end_date.isoformat()
+            }
 
     param_options = [
         _params_for("created_at"),
@@ -395,7 +405,8 @@ def fetch_bookings(start_date, end_date, limit=250, include_items=False, max_pag
     def _page_all(params):
         out, seen, page = [], set(), 1
         while True:
-            q = params.copy(); q["page"] = page
+            q = params.copy()
+            q["page"] = page
             data = _get(q)
             rows = list((data.get("booking/index") or {}).values())
             if not rows:
@@ -403,7 +414,8 @@ def fetch_bookings(start_date, end_date, limit=250, include_items=False, max_pag
             for b in rows:
                 bid = b.get("booking_id")
                 if bid and bid not in seen:
-                    seen.add(bid); out.append(b)
+                    seen.add(bid)
+                    out.append(b)
             if len(rows) < params["limit"]:
                 break
             page += 1
@@ -411,25 +423,38 @@ def fetch_bookings(start_date, end_date, limit=250, include_items=False, max_pag
                 break
         return out
 
+    # --- FIXED LOOP ---
     rows = []
     for params in param_options:
         try:
             rows = _page_all(params)
-            break
+            break  # success
         except requests.HTTPError as e:
-            if not (e.response is not None and e.response.status_code in (400, 403)):
-                raise
+            code = e.response.status_code if e.response is not None else None
+            if code in (400, 403, 500, 502, 503, 504):
+                st.caption(f"⚠️ Server rejected params ({code}). Trying fallback…")
+                continue  # try next strategy
+            raise  # unexpected error
+        except requests.RequestException:
+            st.caption("⚠️ Network error while fetching; trying fallback…")
+            continue
+
+    # Last-resort fallback
+    if not rows:
+        rows = _page_all(common)
 
     # Client-side created-date filter as a safety net
     def _created_ts(b):
         for k in ("created_at", "created_date", "created", "date_created", "timestamp_created"):
             v = b.get(k)
-            if v is None: continue
+            if v is None:
+                continue
             ts = pd.to_datetime(v, unit="s", errors="coerce")
-            if pd.isna(ts): ts = pd.to_datetime(v, errors="coerce")
+            if pd.isna(ts):
+                ts = pd.to_datetime(v, errors="coerce")
             if pd.notna(ts):
                 try:
-                    return (ts.tz_localize("UTC").tz_convert(TENANT_TZ).tz_localize(None))
+                    return ts.tz_localize("UTC").tz_convert(TENANT_TZ).tz_localize(None)
                 except Exception:
                     return ts
         return None
@@ -651,6 +676,219 @@ else:
     current_view = view_booking.copy()
     basis_series = pd.to_datetime(current_view["created_date"], errors="coerce")
     basis_label = "Booking"
+
+# ---------- DEBUG HELPERS ----------
+def _coerce_ts(s):
+    s = pd.to_datetime(s, errors="coerce")
+    try:
+        # drop timezone if present
+        if getattr(s.dt, "tz", None) is not None:
+            s = s.dt.tz_localize(None)
+    except Exception:
+        pass
+    return s
+
+# ---------------------- 🧪 FILTER DIAGNOSTICS ----------------------
+with st.expander("🧪 Filter Diagnostics (why nothing shows?)", expanded=False):
+    st.write({
+        "date_basis": date_basis,
+        "start": str(start),
+        "end": str(end),
+        "status_filter": status_filter,
+        "selected_categories": selected_categories,
+        "selected_products": selected_products,
+        "search": search,
+    })
+
+    # Choose the same “base” df you use for rendering
+    base_df = (view_event.copy() if date_basis == "Event date" else view_booking.copy())
+    basis_col = "event_date" if date_basis == "Event date" else "created_date"
+
+    def _add(step, df, note=""):
+        rows = int(len(df))
+        dbg_rows.append({"step": step, "rows": rows, "note": note})
+
+    dbg_rows = []
+
+    # 0) Base
+    _add("0: Base (before masks)", base_df, f"basis_col={basis_col}")
+
+    # Quick profile
+    bts = _coerce_ts(base_df.get(basis_col))
+    st.write({
+        "basis_min": str(bts.min()) if not base_df.empty else None,
+        "basis_max": str(bts.max()) if not base_df.empty else None,
+        "status_counts": base_df.get("status_name", pd.Series([], dtype=str)).value_counts().to_dict()
+    })
+
+    idx = base_df.index
+    M_all = pd.Series(True, index=idx)
+
+    # A) basis ts exists
+    M_ts_ok = _coerce_ts(base_df.get(basis_col)).notna()
+    _add("A: basis ts notna()", base_df[M_all & M_ts_ok])
+
+    # B) date window
+    start_ts = pd.Timestamp(start)
+    end_excl = pd.Timestamp(end) + pd.Timedelta(days=1)
+    bts = _coerce_ts(base_df.get(basis_col))
+    M_range = M_ts_ok & (bts >= start_ts) & (bts < end_excl)
+    _add(f"B: in [{start} .. {end}]", base_df[M_all & M_range])
+
+    # C) status
+    if status_filter != "All":
+        M_status = base_df["status_name"].astype(str) == str(status_filter)
+    else:
+        M_status = pd.Series(True, index=idx)
+    _add("C: status filter", base_df[M_all & M_range & M_status],
+         note=f"wanted='{status_filter}'")
+
+    # D) search
+    s_txt = (search or "").strip().lower()
+    if s_txt:
+        M_search = base_df.apply(
+            lambda r: s_txt in str(r.get("customer_name","")).lower()
+                   or s_txt in str(r.get("customer_email","")).lower()
+                   or s_txt in str(r.get("code","")).lower()
+                   or s_txt in str(r.get("booking_id","")).lower(),
+            axis=1
+        )
+    else:
+        M_search = pd.Series(True, index=idx)
+    _add("D: search", base_df[M_all & M_range & M_status & M_search])
+
+    # E) category (mirrors your _apply_filters logic)
+    if selected_categories:
+        sel_cats = set(selected_categories)
+        def _has_cat(summary: str) -> bool:
+            for part in _parts(summary):
+                if catalog["name_to_cats"].get(part, set()) & sel_cats:
+                    return True
+            return False
+        M_cat = base_df["summary"].astype(str).apply(_has_cat)
+    else:
+        M_cat = pd.Series(True, index=idx)
+    _add("E: category", base_df[M_all & M_range & M_status & M_search & M_cat],
+         note=f"selected_categories={selected_categories}")
+
+    # F) products
+    if selected_products:
+        selp = {_norm_title(p) for p in selected_products}
+        def _has_prod(summary: str) -> bool:
+            return any(p in selp for p in _parts(summary))
+        M_prod = base_df["summary"].astype(str).apply(_has_prod)
+    else:
+        M_prod = pd.Series(True, index=idx)
+
+    final_mask = M_all & M_range & M_status & M_search & M_cat & M_prod
+    _add("F: products", base_df[final_mask], note=f"selected_products={selected_products}")
+
+    st.table(pd.DataFrame(dbg_rows))
+
+    if len(base_df) and final_mask.sum() == 0:
+        hints = []
+        if M_ts_ok.sum() == 0:
+            hints.append(f"No valid timestamps in `{basis_col}` (check date basis or event-date extraction).")
+        elif M_range.sum() == 0:
+            hints.append("Date window excludes all rows (see basis_min/basis_max above).")
+        elif (status_filter != "All") and (M_status.sum() == 0):
+            hints.append(f"No rows with status exactly '{status_filter}'.")
+        elif selected_categories and (M_cat.sum() == 0):
+            hints.append("Category mapping may not match summaries (smart quotes/hyphens).")
+        elif selected_products and (M_prod.sum() == 0):
+            hints.append("Product names may not match summary parts (normalization).")
+        elif s_txt and (M_search.sum() == 0):
+            hints.append("Search text matched none of name/email/code/booking_id.")
+        st.warning("No rows after filters. Likely causes:\n- " + "\n- ".join(hints))
+
+    # Samples to eyeball
+    st.caption("Samples at key steps")
+    st.write("**Base**")
+    st.dataframe(base_df.head(5))
+    st.write("**After date window**")
+    st.dataframe(base_df[M_range].head(5))
+    st.write("**After status**")
+    st.dataframe(base_df[M_range & M_status].head(5))
+    st.write("**Final selection**")
+    st.dataframe(base_df[final_mask].head(10))
+# --------------------------------------------------------------------------------------------
+
+
+# --- Debug: list unique summaries ---
+with st.expander("🔍 Unique summaries in current data"):
+    if not current_view.empty:
+        unique_summaries = sorted(current_view["summary"].dropna().unique().tolist())
+        st.write(f"Found {len(unique_summaries)} unique item summaries")
+        st.dataframe(pd.DataFrame(unique_summaries, columns=["summary"]))
+    else:
+        st.info("No rows in current view.")
+        
+# --- Debug: show the exact bookings currently used downstream ---
+with st.expander("🔎 Bookings pulled from API (current basis + range)", expanded=False):
+    basis_col = "event_date" if date_basis == "Event date" else "created_date"
+
+    # Basic stats
+    st.write({
+        "basis": basis_label,
+        "range_inclusive": f"{start} → {end}",
+        "rows_in_view": int(len(current_view)),
+        "min_basis": str(pd.to_datetime(current_view.get(basis_col), errors="coerce").min()),
+        "max_basis": str(pd.to_datetime(current_view.get(basis_col), errors="coerce").max()),
+        "status_counts": current_view.get("status_name", pd.Series([], dtype=str)).value_counts().to_dict(),
+    })
+
+    # Nicely ordered set of columns for human inspection
+    cols = [
+        "booking_id", "code",
+        basis_col,
+        "summary", "status_name",
+        "total", "tax_total", "total_ex_vat",
+        "paid_total",
+        "customer_name", "customer_email",
+        "date_desc"  # useful when event-basis
+    ]
+    cols = [c for c in cols if c in current_view.columns]  # keep only existing
+    df_show = (current_view
+               .sort_values(basis_col, na_position="last")
+               .loc[:, cols])
+
+    st.dataframe(df_show, use_container_width=True, height=420)
+
+    # Quick day/tour rollups to compare with Checkfront totals
+    if basis_col in current_view.columns:
+        st.caption("Quick rollups to cross-check against Checkfront")
+        by_day = (pd.to_datetime(current_view[basis_col], errors="coerce")
+                    .dt.date.value_counts().sort_index())
+        st.write("Bookings per day:", by_day.to_dict())
+
+        by_item = current_view["summary"].value_counts()
+        st.write("Bookings per item:", by_item.to_dict())
+
+    # Export for side-by-side comparison in Excel
+    csv = current_view.sort_values(basis_col, na_position="last").to_csv(index=False).encode("utf-8-sig")
+    st.download_button(
+        "⬇️ Download CSV of current view",
+        data=csv,
+        file_name=f"shoebox_current_view_{basis_label.lower()}_{start}_{end}.csv",
+        mime="text/csv",
+        use_container_width=True,
+    )
+
+    # Optional: inspect one booking's raw JSON (detail endpoint)
+    if "booking_id" in current_view.columns:
+        bid = st.selectbox(
+            "Inspect booking detail (raw JSON)", 
+            options=current_view["booking_id"].astype(str).tolist(),
+            index=0 if len(current_view) else None
+        )
+        if st.button("Fetch booking JSON"):
+            try:
+                detail = fetch_booking_details(bid)
+                st.json(detail)
+            except Exception as e:
+                st.error(f"Detail fetch failed for {bid}: {e}")
+
+
 
 
 # --- KPIs ---
@@ -1042,6 +1280,23 @@ with st.sidebar:
     else:
         st.button("Download PDF (unavailable)", disabled=True, use_container_width=True)
         st.caption("PDF will appear once there’s data and the report is built.")
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 
