@@ -249,7 +249,7 @@ help_box = st.empty()
 if not st.session_state.get("applied_once", False):
     help_box.info(
         "First click **Apply filters** in the sidebar on the left. "
-        "Then set your filters and press **Apply filters** once more."
+        "Then set your filters, once you have set filters do not click **Apply filters** unless you are changing to event based, as this will reload the entire dashboard. Slowing down the process."
     )
 else:
     help_box.caption(
@@ -1706,6 +1706,7 @@ with st.sidebar:
     else:
         st.button("Download PDF (unavailable)", disabled=True, use_container_width=True)
         st.caption("PDF will appear once there’s data and the report is built.")
+
 
 
 
