@@ -748,118 +748,136 @@ start_ts = pd.Timestamp(start)
 end_excl = pd.Timestamp(end) + pd.Timedelta(days=1)
 
 # --- Booking basis (created) ---
-raw_booking = get_raw(start, end, include_items=False, filter_on="created",
-                      category_ids=[], item_ids=[])
-df_booking_raw = prepared_df_cached(raw_booking)           # <-- keep raw
-df_booking      = df_booking_raw.copy()
-df_booking      = _apply_filters(df_booking, selected_categories, selected_products, status_filter, search)
+# Booking-created basis (index, no items)
+raw_booking   = get_raw(start, end, include_items=False, filter_on="created")
+df_booking    = prepare_df(raw_booking)
 
+# keep an unfiltered copy for diagnostics
+df_booking_raw = df_booking.copy()
+
+# apply sidebar filters to booking df
+df_booking = _apply_filters(df_booking, selected_categories, selected_products,
+                            st.session_state.get("status_sel", "All"), search)
+
+# clamp to created-date window
 cd_booking  = pd.to_datetime(df_booking["created_date"], errors="coerce")
+start_ts    = pd.Timestamp(start)
+end_excl    = pd.Timestamp(end) + pd.Timedelta(days=1)
 mask_b      = cd_booking.notna() & (cd_booking >= start_ts) & (cd_booking < end_excl)
 view_booking = df_booking.loc[mask_b].copy()
 
-# ---------------------- EVENT-BASIS (resilient, no per-day loop) ----------------------
+
+# -------------------- EVENT-DATE BRANCH --------------------
 if date_basis == "Event date":
-    # Phase 1: one index pull (no items) over the whole range
-    # (index is much cheaper; we only fetch details for rows we keep)
-    raw_idx = get_raw(start, end, include_items=False, filter_on="created")
+    # Phase note (optional)
+    st.caption("Phase: index without items, then per-booking details.")
+
+    # 1) Pull the bookings index WITHOUT items (more reliable than expand=items)
+    raw_idx = get_raw(start, end, include_items=False, filter_on="event")
     df_idx  = prepare_df(raw_idx)
 
-    # Apply sidebar filters first so we minimize detail calls
-    df_idx = _apply_filters(df_idx, selected_categories, selected_products,
-                            st.session_state.get("status_sel", "All"), search)
+    # 2) Try to derive an event datetime from lightweight fields first
+    df_idx["event_date"] = pd.NaT
+    if "date_desc" in df_idx.columns:
+        df_idx["event_date"] = pd.to_datetime(df_idx["date_desc"], errors="coerce")
 
-    # Restrict to created range (created window = what we asked for in get_raw)
-    created_ts = pd.to_datetime(df_idx["created_date"], errors="coerce")
-    m_created  = created_ts.notna()
-    df_idx     = df_idx.loc[m_created].copy()
+    # 3) For rows still missing an event_date, fetch booking details and extract
+    need_detail = df_idx["event_date"].isna()
+    ids_missing = (
+        df_idx.loc[need_detail, "booking_id"]
+              .dropna()
+              .astype(str)
+              .tolist()
+    )
 
-    # Small helper to turn a detail payload into an event datetime
-    def _extract_event_dt_from_detail(detail):
-        # detail is the JSON from fetch_booking_details(booking_id)
-        items = None
-        try:
-            # Checkfront detail commonly nests items at ["booking"]["items"] or similar.
-            # Your prepare_df() flattens in index mode, so we just probe safely here.
-            if isinstance(detail, dict):
-                # try a few likely places
-                items = (detail.get("booking", {}) or {}).get("items")
+    # Put a sensible cap so we don't hammer the API on huge ranges
+    MAX_DETAIL = 200
+    if ids_missing:
+        progress = st.progress(0.0)
+        N = min(len(ids_missing), MAX_DETAIL)
+
+        for i, bid in enumerate(ids_missing[:MAX_DETAIL], start=1):
+            try:
+                detail = fetch_booking_details(bid)  # expands items
+
+                # Normalise items to a list[dict]
+                items = (detail.get("booking") or {}).get("items")
                 if items is None:
-                    items = detail.get("items")
-        except Exception:
-            items = None
+                    items = detail.get("items", [])
+                if isinstance(items, dict):
+                    items = list(items.values())
+                if not isinstance(items, list):
+                    items = []
 
-        # Normalize to list of dicts
-        if isinstance(items, dict):
-            items = list(items.values())
-        if not isinstance(items, list):
-            items = []
-
-        cands = []
-        for it in items:
-            if not isinstance(it, dict):
-                continue
-            # Look in item and nested date dicts
-            for src in (it, it.get("date") if isinstance(it.get("date"), dict) else None):
-                if not isinstance(src, dict):
-                    continue
-                for key in ("start","start_date","date_start","from","event_date","date","datetime"):
-                    v = src.get(key)
-                    if v is None:
+                # Mine candidate datetimes from a variety of common keys
+                cands = []
+                for it in items:
+                    if not isinstance(it, dict):
                         continue
-                    dt = (pd.to_datetime(v, unit="s", errors="coerce")
-                          if isinstance(v, (int, float)) else pd.to_datetime(v, errors="coerce"))
-                    if pd.notna(dt):
-                        cands.append(dt)
 
-            # Sometimes a friendly string exists
-            v = it.get("date_desc")
-            if v:
-                dt = pd.to_datetime(v, errors="coerce")
-                if pd.notna(dt):
-                    cands.append(dt)
+                    # primary dict or nested it["date"] dict
+                    for src in (it, it.get("date") if isinstance(it.get("date"), dict) else None):
+                        if not isinstance(src, dict):
+                            continue
+                        for key in ("start", "start_date", "date_start", "from", "event_date", "date", "datetime"):
+                            v = src.get(key)
+                            if v is None:
+                                continue
+                            dt = (
+                                pd.to_datetime(v, unit="s", errors="coerce")
+                                if isinstance(v, (int, float))
+                                else pd.to_datetime(v, errors="coerce")
+                            )
+                            if pd.notna(dt):
+                                cands.append(dt)
 
-        return (min(cands) if cands else pd.NaT)
+                    # sometimes a friendly string lives here
+                    v_desc = it.get("date_desc")
+                    if v_desc is not None:
+                        dt = pd.to_datetime(v_desc, errors="coerce")
+                        if pd.notna(dt):
+                            cands.append(dt)
 
-    # Cache detail calls (5 min) so reruns don’t re-hit the API
-    @st.cache_data(ttl=300, show_spinner=False)
-    def _cached_detail(bid: str | int):
-        return fetch_booking_details(bid)
+                if cands:
+                    ev = min(cands)
+                    # booking_id might be int or str in df; match either
+                    try_id = int(bid) if bid.isdigit() else bid
+                    df_idx.loc[df_idx["booking_id"] == try_id, "event_date"] = ev
 
-    # Throttle detail calls very slightly to avoid bursts (0.2s)
-    def _throttled_detail(bid):
-        detail = _cached_detail(bid)
-        time.sleep(0.2)
-        return detail
+            except Exception:
+                # swallow and continue to keep UI responsive
+                pass
 
-    # Phase 2: enrich kept rows with event_date via detail
-    # (do not crash if any single booking fails)
-    event_dates = []
-    for _, row in df_idx.iterrows():
-        bid = row.get("booking_id")
-        try:
-            if pd.isna(bid):
-                event_dates.append(pd.NaT)
-                continue
-            d = _throttled_detail(str(bid))
-            ed = _extract_event_dt_from_detail(d)
-            event_dates.append(ed)
-        except Exception as e:
-            # Don’t block the page for one bad booking
-            event_dates.append(pd.NaT)
+            progress.progress(i / N)
 
-    df_idx["event_date"] = pd.to_datetime(event_dates, errors="coerce")
+        progress.empty()
 
-    # Final mask on the actual event window
+    # 4) Ensure dtype & drop tz if any
+    df_idx["event_date"] = pd.to_datetime(df_idx["event_date"], errors="coerce")
+
+    # ------ keep an UNFILTERED snapshot for diagnostics ------
+    df_event_raw = df_idx.copy()
+
+    # 5) Apply your normal client-side filters
+    df_idx = _apply_filters(
+        df_idx,
+        selected_categories,
+        selected_products,
+        st.session_state.get("status_sel", "All"),
+        search,
+    )
+
+    # 6) Clamp to the selected event window
     start_ts = pd.Timestamp(start)
     end_excl = pd.Timestamp(end) + pd.Timedelta(days=1)
     m_event  = df_idx["event_date"].notna() & (df_idx["event_date"] >= start_ts) & (df_idx["event_date"] < end_excl)
-
     view_event = df_idx.loc[m_event].copy()
-else:
-    view_event = pd.DataFrame()
-# -------------------------------------------------------------------
 
+else:
+    # Non-event basis: make sure the variable exists for diagnostics
+    view_event   = pd.DataFrame()
+    df_event_raw = pd.DataFrame()
+# ------------------ END EVENT-DATE BRANCH -------------------
 
 
 
@@ -1352,23 +1370,27 @@ with col3:
     st.plotly_chart(fig3, use_container_width=True)
 
 # ----------------  MONTHLY (full-month totals for months touched by range)  ----------------
+# ----------------  MONTHLY (full-month totals for months touched by range)  ----------------
 m_start = date(start.year, start.month, 1)
 m_end   = date(end.year, end.month, calendar.monthrange(end.year, end.month)[1])
 
 if date_basis == "Event date":
-    df_m  = df_event.copy()
+    # Reuse the event-date view you already built
+    df_m = view_event.copy()
     if df_m.empty:
-        raw_m = get_raw(m_start, m_end, include_items=True, filter_on="event")
-        df_m  = prepare_df(raw_m)
-        if "items" not in df_m.columns:
-            df_m["items"] = [[] for _ in range(len(df_m))]
-        df_m["event_date"] = df_m["items"].apply(lambda it: pd.NaT)  # already computed earlier when used
-        df_m["event_date"] = pd.to_datetime(df_m["event_date"], errors="coerce")
-    df_m  = _apply_filters(df_m, selected_categories, selected_products, status_filter, search)
+        # fallback: keep a valid empty DataFrame with expected columns
+        df_m = pd.DataFrame(columns=list(df_event_raw.columns) + ["event_date"])
     date_series_m = pd.to_datetime(df_m["event_date"], errors="coerce")
+
 else:
     raw_m = get_raw(m_start, m_end, include_items=False, filter_on="created")
-    df_m  = _apply_filters(prepare_df(raw_m), selected_categories, selected_products, status_filter, search)
+    df_m  = _apply_filters(
+        prepare_df(raw_m),
+        selected_categories,
+        selected_products,
+        status_filter,
+        search,
+    )
     date_series_m = pd.to_datetime(df_m["created_date"], errors="coerce")
 
 df_m = df_m[date_series_m.notna()].copy()
@@ -1388,6 +1410,7 @@ fig_monthly = px.bar(
 fig_monthly.update_traces(texttemplate="£%{y:,.0f}")
 fig_monthly.update_yaxes(tickprefix="£", tickformat=",")
 st.plotly_chart(fig_monthly, use_container_width=True)
+
 
 # Day/Hour charts
 c5, c6 = st.columns(2)
@@ -1479,8 +1502,8 @@ else:
 
 if date_basis == "Event date":
     # Pull event-dated bookings with items so we can derive event_date
-    raw_q = get_raw(fy_start, fy_end, include_items=True, filter_on="event")
-    df_q = prepare_df(raw_q).copy()
+    df_q = view_event.copy()  # or df_event_raw.copy() if you want ALL unfiltered events
+    date_series_q = pd.to_datetime(df_q["event_date"], errors="coerce")
     if "items" not in df_q.columns:
         df_q["items"] = [[] for _ in range(len(df_q))]
 
@@ -1683,8 +1706,6 @@ with st.sidebar:
     else:
         st.button("Download PDF (unavailable)", disabled=True, use_container_width=True)
         st.caption("PDF will appear once there’s data and the report is built.")
-
-
 
 
 
