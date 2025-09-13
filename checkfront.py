@@ -758,82 +758,108 @@ cd_booking  = pd.to_datetime(df_booking["created_date"], errors="coerce")
 mask_b      = cd_booking.notna() & (cd_booking >= start_ts) & (cd_booking < end_excl)
 view_booking = df_booking.loc[mask_b].copy()
 
-# Event-basis (if used)
+# ---------------------- EVENT-BASIS (resilient, no per-day loop) ----------------------
 if date_basis == "Event date":
-    # We must expand items to derive an event timestamp
-    raw_event = get_raw(start, end, include_items=True, filter_on="event",
-                        category_ids=[], item_ids=[])
-    df_event = prepare_df(raw_event).copy()
+    # Phase 1: one index pull (no items) over the whole range
+    # (index is much cheaper; we only fetch details for rows we keep)
+    raw_idx = get_raw(start, end, include_items=False, filter_on="created")
+    df_idx  = prepare_df(raw_idx)
 
-    if df_event.empty:
-        # Nothing returned; keep a valid empty frame with the right columns
-        view_event = pd.DataFrame(columns=list(df_event.columns) + ["event_date"])
-    else:
-        # Ensure 'items' exists (needed for extraction)
-        if "items" not in df_event.columns:
-            df_event["items"] = [[] for _ in range(len(df_event))]
+    # Apply sidebar filters first so we minimize detail calls
+    df_idx = _apply_filters(df_idx, selected_categories, selected_products,
+                            st.session_state.get("status_sel", "All"), search)
 
-        # Robust event-datetime extractor from the items payload
-        def _extract_event_dt_from_items(items):
-            if isinstance(items, dict):
-                items = list(items.values())
-            if not isinstance(items, list):
-                return pd.NaT
-            cands = []
-            for it in items:
-                if not isinstance(it, dict):
+    # Restrict to created range (created window = what we asked for in get_raw)
+    created_ts = pd.to_datetime(df_idx["created_date"], errors="coerce")
+    m_created  = created_ts.notna()
+    df_idx     = df_idx.loc[m_created].copy()
+
+    # Small helper to turn a detail payload into an event datetime
+    def _extract_event_dt_from_detail(detail):
+        # detail is the JSON from fetch_booking_details(booking_id)
+        items = None
+        try:
+            # Checkfront detail commonly nests items at ["booking"]["items"] or similar.
+            # Your prepare_df() flattens in index mode, so we just probe safely here.
+            if isinstance(detail, dict):
+                # try a few likely places
+                items = (detail.get("booking", {}) or {}).get("items")
+                if items is None:
+                    items = detail.get("items")
+        except Exception:
+            items = None
+
+        # Normalize to list of dicts
+        if isinstance(items, dict):
+            items = list(items.values())
+        if not isinstance(items, list):
+            items = []
+
+        cands = []
+        for it in items:
+            if not isinstance(it, dict):
+                continue
+            # Look in item and nested date dicts
+            for src in (it, it.get("date") if isinstance(it.get("date"), dict) else None):
+                if not isinstance(src, dict):
                     continue
-                # try both at top level and inside 'date' sub-dict
-                for src in (it, it.get("date") if isinstance(it.get("date"), dict) else None):
-                    if not isinstance(src, dict):
+                for key in ("start","start_date","date_start","from","event_date","date","datetime"):
+                    v = src.get(key)
+                    if v is None:
                         continue
-                    for key in ("start", "start_date", "date_start",
-                                "from", "event_date", "date", "datetime"):
-                        v = src.get(key)
-                        if v is None:
-                            continue
-                        dt = (pd.to_datetime(v, unit="s", errors="coerce")
-                              if isinstance(v, (int, float)) else
-                              pd.to_datetime(v, errors="coerce"))
-                        if pd.notna(dt):
-                            cands.append(dt)
-                # sometimes there is only a free-text date string
-                v = it.get("date_desc")
-                if v:
-                    dt = pd.to_datetime(v, errors="coerce")
+                    dt = (pd.to_datetime(v, unit="s", errors="coerce")
+                          if isinstance(v, (int, float)) else pd.to_datetime(v, errors="coerce"))
                     if pd.notna(dt):
                         cands.append(dt)
-            return min(cands) if cands else pd.NaT
 
-        # Build/repair the 'event_date' column safely
-        if "event_date" not in df_event.columns:
-            df_event["event_date"] = pd.NaT
+            # Sometimes a friendly string exists
+            v = it.get("date_desc")
+            if v:
+                dt = pd.to_datetime(v, errors="coerce")
+                if pd.notna(dt):
+                    cands.append(dt)
 
-        # Only compute for rows still missing event_date
-        missing_mask = pd.to_datetime(df_event["event_date"], errors="coerce").isna()
-        if missing_mask.any():
-            df_event.loc[missing_mask, "event_date"] = df_event.loc[missing_mask, "items"].apply(_extract_event_dt_from_items)
+        return (min(cands) if cands else pd.NaT)
 
-        # Last-chance fill from a flat 'date_desc' column if present
-        if "date_desc" in df_event.columns:
-            fallback = pd.to_datetime(df_event["date_desc"], errors="coerce")
-            cur = pd.to_datetime(df_event["event_date"], errors="coerce")
-            df_event["event_date"] = cur.fillna(fallback)
+    # Cache detail calls (5 min) so reruns don’t re-hit the API
+    @st.cache_data(ttl=300, show_spinner=False)
+    def _cached_detail(bid: str | int):
+        return fetch_booking_details(bid)
 
-        # Final coercion to datetime
-        df_event["event_date"] = pd.to_datetime(df_event["event_date"], errors="coerce")
+    # Throttle detail calls very slightly to avoid bursts (0.2s)
+    def _throttled_detail(bid):
+        detail = _cached_detail(bid)
+        time.sleep(0.2)
+        return detail
 
-        # Apply sidebar filters, then date-range mask on event_date
-        df_event = _apply_filters(df_event, selected_categories, selected_products, status_filter, search)
+    # Phase 2: enrich kept rows with event_date via detail
+    # (do not crash if any single booking fails)
+    event_dates = []
+    for _, row in df_idx.iterrows():
+        bid = row.get("booking_id")
+        try:
+            if pd.isna(bid):
+                event_dates.append(pd.NaT)
+                continue
+            d = _throttled_detail(str(bid))
+            ed = _extract_event_dt_from_detail(d)
+            event_dates.append(ed)
+        except Exception as e:
+            # Don’t block the page for one bad booking
+            event_dates.append(pd.NaT)
 
-        ed_event = pd.to_datetime(df_event["event_date"], errors="coerce")
-        start_ts = pd.Timestamp(start)
-        end_excl = pd.Timestamp(end) + pd.Timedelta(days=1)
-        mask_e = ed_event.notna() & (ed_event >= start_ts) & (ed_event < end_excl)
+    df_idx["event_date"] = pd.to_datetime(event_dates, errors="coerce")
 
-        view_event = df_event.loc[mask_e].copy()
+    # Final mask on the actual event window
+    start_ts = pd.Timestamp(start)
+    end_excl = pd.Timestamp(end) + pd.Timedelta(days=1)
+    m_event  = df_idx["event_date"].notna() & (df_idx["event_date"] >= start_ts) & (df_idx["event_date"] < end_excl)
+
+    view_event = df_idx.loc[m_event].copy()
 else:
     view_event = pd.DataFrame()
+# -------------------------------------------------------------------
+
 
 
 
@@ -1657,6 +1683,7 @@ with st.sidebar:
     else:
         st.button("Download PDF (unavailable)", disabled=True, use_container_width=True)
         st.caption("PDF will appear once there’s data and the report is built.")
+
 
 
 
