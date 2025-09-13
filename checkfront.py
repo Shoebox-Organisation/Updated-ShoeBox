@@ -758,128 +758,83 @@ cd_booking  = pd.to_datetime(df_booking["created_date"], errors="coerce")
 mask_b      = cd_booking.notna() & (cd_booking >= start_ts) & (cd_booking < end_excl)
 view_booking = df_booking.loc[mask_b].copy()
 
+# Event-basis (if used)
 if date_basis == "Event date":
-    # Decide whether to pull items
-    need_items_for_event = False  # or True if you want item-level event dates
+    # We must expand items to derive an event timestamp
+    raw_event = get_raw(start, end, include_items=True, filter_on="event",
+                        category_ids=[], item_ids=[])
+    df_event = prepare_df(raw_event).copy()
 
-    raw_event = get_raw(
-        start, end,
-        include_items=need_items_for_event,
-        filter_on="event",
-        category_ids=[], item_ids=[]
-    )
+    if df_event.empty:
+        # Nothing returned; keep a valid empty frame with the right columns
+        view_event = pd.DataFrame(columns=list(df_event.columns) + ["event_date"])
+    else:
+        # Ensure 'items' exists (needed for extraction)
+        if "items" not in df_event.columns:
+            df_event["items"] = [[] for _ in range(len(df_event))]
 
-    # Keep raw (unfiltered) copy
-    df_event_raw = prepare_df(raw_event)
-
-    # Copy for processing
-    df_event = df_event_raw.copy()
-
-    # ... run your event_date enrichment on df_event here ...
-
-    # Apply filters
-    df_event = _apply_filters(
-        df_event,
-        selected_categories,
-        selected_products,
-        status_filter,
-        search
-    )
-
-    ed_event = pd.to_datetime(df_event["event_date"], errors="coerce")
-    mask_e   = ed_event.notna() & (ed_event >= start_ts) & (ed_event < end_excl)
-    view_event = df_event.loc[mask_e].copy()
-
-
-    # Ensure a column exists for later logic
-    if "items" not in df_event.columns:
-        df_event["items"] = [[] for _ in range(len(df_event))]
-
-    # Robust extraction — prefers item dates if present (won’t be for this first pass),
-    # then falls back to date_desc or other date-ish fields in index rows.
-    def _extract_event_dt_from_row(row):
-        # A) Try items (if present later during selective enrichment)
-        items = row.get("items", [])
-        if isinstance(items, dict):
-            items = list(items.values())
-        if isinstance(items, list) and items:
+        # Robust event-datetime extractor from the items payload
+        def _extract_event_dt_from_items(items):
+            if isinstance(items, dict):
+                items = list(items.values())
+            if not isinstance(items, list):
+                return pd.NaT
             cands = []
             for it in items:
                 if not isinstance(it, dict):
                     continue
+                # try both at top level and inside 'date' sub-dict
                 for src in (it, it.get("date") if isinstance(it.get("date"), dict) else None):
                     if not isinstance(src, dict):
                         continue
-                    for key in ("start","start_date","date_start","from","event_date","date","datetime"):
+                    for key in ("start", "start_date", "date_start",
+                                "from", "event_date", "date", "datetime"):
                         v = src.get(key)
                         if v is None:
                             continue
-                        dt = pd.to_datetime(v, unit="s", errors="coerce") if isinstance(v,(int,float)) else pd.to_datetime(v, errors="coerce")
+                        dt = (pd.to_datetime(v, unit="s", errors="coerce")
+                              if isinstance(v, (int, float)) else
+                              pd.to_datetime(v, errors="coerce"))
                         if pd.notna(dt):
                             cands.append(dt)
+                # sometimes there is only a free-text date string
                 v = it.get("date_desc")
                 if v:
                     dt = pd.to_datetime(v, errors="coerce")
                     if pd.notna(dt):
                         cands.append(dt)
-            if cands:
-                return min(cands)
+            return min(cands) if cands else pd.NaT
 
-        # B) Fall back to index-level hints (fast path)
-        for k in ("date_desc","event_date","start_date","date"):
-            if k in row and pd.notna(row[k]):
-                dt = pd.to_datetime(row[k], errors="coerce")
-                if pd.notna(dt):
-                    return dt
+        # Build/repair the 'event_date' column safely
+        if "event_date" not in df_event.columns:
+            df_event["event_date"] = pd.NaT
 
-        return pd.NaT
+        # Only compute for rows still missing event_date
+        missing_mask = pd.to_datetime(df_event["event_date"], errors="coerce").isna()
+        if missing_mask.any():
+            df_event.loc[missing_mask, "event_date"] = df_event.loc[missing_mask, "items"].apply(_extract_event_dt_from_items)
 
-    # Compute event_date from what we have now (no items)
-    df_event["event_date"] = df_event.apply(_extract_event_dt_from_row, axis=1)
+        # Last-chance fill from a flat 'date_desc' column if present
+        if "date_desc" in df_event.columns:
+            fallback = pd.to_datetime(df_event["date_desc"], errors="coerce")
+            cur = pd.to_datetime(df_event["event_date"], errors="coerce")
+            df_event["event_date"] = cur.fillna(fallback)
 
-    # If too many are still missing, we’ll selectively enrich ONLY those rows
-    missing_mask = df_event["event_date"].isna()
-    missing_count = int(missing_mask.sum())
-    total_count   = int(len(df_event))
-    pct_missing   = (missing_count / total_count * 100) if total_count else 0.0
+        # Final coercion to datetime
+        df_event["event_date"] = pd.to_datetime(df_event["event_date"], errors="coerce")
 
-    if missing_count and pct_missing > 40:
-        # 2) Selective enrichment just for rows still missing an event date.
-        #    We’ll fetch booking details (cached) and re-run extraction on those rows only.
-        st.caption(f"↪️ Enriching {missing_count} bookings (missing event_date) with detail calls…")
+        # Apply sidebar filters, then date-range mask on event_date
+        df_event = _apply_filters(df_event, selected_categories, selected_products, status_filter, search)
 
-        # Small helper that’s cached in fetch_bookings; re-use detail endpoint here directly:
-        def _fetch_detail(bid):
-            try:
-                return fetch_booking_details(bid)
-            except Exception:
-                return {}
+        ed_event = pd.to_datetime(df_event["event_date"], errors="coerce")
+        start_ts = pd.Timestamp(start)
+        end_excl = pd.Timestamp(end) + pd.Timedelta(days=1)
+        mask_e = ed_event.notna() & (ed_event >= start_ts) & (ed_event < end_excl)
 
-        # Only touch the missing ones (cap to avoid long waits when API is sick)
-        MAX_ENRICH = 250
-        to_fix = df_event.loc[missing_mask].head(MAX_ENRICH).copy()
-
-        new_items = {}
-        for bid in to_fix.get("booking_id", []):
-            d = _fetch_detail(bid)
-            items = (d.get("booking", {}).get("items")
-                     or d.get("items") or [])
-            new_items[bid] = items
-
-        # Attach enriched items and recompute event_date for those rows
-        if new_items:
-            idx = df_event["booking_id"].map(new_items.get).notna()
-            df_event.loc[idx, "items"] = df_event.loc[idx, "booking_id"].map(new_items.get)
-            df_event.loc[idx, "event_date"] = df_event.loc[idx].apply(_extract_event_dt_from_row, axis=1)
-
-    # Apply filters and windowing
-    df_event = _apply_filters(df_event, selected_categories, selected_products, status_filter, search)
-    ed_event = pd.to_datetime(df_event["event_date"], errors="coerce")
-    mask_e   = ed_event.notna() & (ed_event >= start_ts) & (ed_event < end_excl)
-    view_event = df_event.loc[mask_e].copy()
-
+        view_event = df_event.loc[mask_e].copy()
 else:
     view_event = pd.DataFrame()
+
 
 
 # Choose current view (drives KPIs & charts up to Stock section)
@@ -1702,6 +1657,7 @@ with st.sidebar:
     else:
         st.button("Download PDF (unavailable)", disabled=True, use_container_width=True)
         st.caption("PDF will appear once there’s data and the report is built.")
+
 
 
 
