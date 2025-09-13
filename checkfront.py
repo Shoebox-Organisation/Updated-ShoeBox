@@ -1648,7 +1648,7 @@ def create_detailed_pdf_summary(kpi_data, date_range, top_tour, top_day, recent_
         pdf.cell(col_widths[4], 8, date_str, border=1)
         pdf.ln()
 
-    return pdf.output(dest="S").encode("latin-1")
+    return pdf.output(dest="S").encode("latin-1", "replace")
 
 
 # ================================
@@ -1702,6 +1702,7 @@ with st.sidebar:
     else:
         st.button("Download PDF (unavailable)", disabled=True, use_container_width=True)
         st.caption("PDF will appear once there’s data and the report is built.")
+
 
 
 
